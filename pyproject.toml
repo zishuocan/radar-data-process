@@ -1,0 +1,22 @@
+[project]
+name = "radar-app"
+version = "0.1.0"
+description = "Unified desktop application for BUAA week 2 FMCW radar bin processing."
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib",
+  "numpy",
+]
+
+[project.scripts]
+radar-app = "radar_app.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
