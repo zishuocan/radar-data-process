@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 import numpy as np
+from scipy.ndimage import maximum_filter, uniform_filter
 
 from radar_app.core.params import C0, RadarParams
 from radar_app.core.signal import EPS, make_window, next_fft_size
@@ -308,14 +309,6 @@ def normalized_power_db(power: np.ndarray, floor_db: float) -> np.ndarray:
     return 10.0 * np.log10(np.maximum(power / max(power_max, EPS), 10.0 ** (floor_db / 10.0)))
 
 
-def _integral_image(values: np.ndarray) -> np.ndarray:
-    return np.pad(values.cumsum(axis=0).cumsum(axis=1), ((1, 0), (1, 0)), mode="constant")
-
-
-def _box_sum(integral: np.ndarray, a0: int, a1: int, r0: int, r1: int) -> float:
-    return float(integral[a1, r1] - integral[a0, r1] - integral[a1, r0] + integral[a0, r0])
-
-
 def ca_cfar_2d(
     power: np.ndarray,
     ranges_m: np.ndarray,
@@ -330,6 +323,7 @@ def ca_cfar_2d(
     min_gap_m: float,
     min_gap_deg: float,
 ) -> list[CfarDetection]:
+    """2D CA-CFAR 检测（向量化实现，使用 SciPy uniform_filter）"""
     if power.size == 0:
         return []
 
@@ -352,50 +346,44 @@ def ca_cfar_2d(
     angle_start = angle_margin
     angle_stop = n_angles - angle_margin
     threshold_scale = 10.0 ** (threshold_db / 10.0)
-    integral = _integral_image(power)
     power_max = float(np.max(power))
 
-    # 预筛选：跳过功率过低的像素（快速剔除噪声）
-    global_median = float(np.median(power[angle_start:angle_stop, range_start:range_stop]))
-    pre_threshold = max(global_median * threshold_scale * 0.5, 1e-30)
-    power_roi = power[angle_start:angle_stop, range_start:range_stop]
-    candidate_mask = power_roi > pre_threshold
-    candidate_rows, candidate_cols = np.where(candidate_mask)
-    # 只对候选像素做完整 CFAR 检测
+    # ========== 向量化噪声估计 ==========
+    # 用 uniform_filter 计算局部均值（等效积分图，但 O(1) 全图一次性算出）
+    outer_count = (2 * angle_margin + 1) * (2 * range_margin + 1)
+    guard_count = (2 * guard_angle + 1) * (2 * guard_range + 1)
+    noise_count = outer_count - guard_count
+    if noise_count <= 0:
+        return []
+
+    outer_mean = uniform_filter(power, size=(2 * angle_margin + 1, 2 * range_margin + 1), mode="constant")
+    guard_mean = uniform_filter(power, size=(2 * guard_angle + 1, 2 * guard_range + 1), mode="constant")
+
+    # 噪声功率 = (外窗总功率 - 保护窗总功率) / 噪声单元数
+    noise_power = np.maximum((outer_mean * outer_count - guard_mean * guard_count) / noise_count, EPS)
+
+    # ========== 向量化检测 ==========
+    # 构建有效区域掩码（排除边缘像素）
+    valid_mask = np.zeros_like(power, dtype=bool)
+    valid_mask[angle_start:angle_stop, range_start:range_stop] = True
+
+    # CFAR 门限比较
+    cfar_mask = (power > noise_power * threshold_scale) & valid_mask & (power > 0)
+
+    # 3×3 局部极大值
+    local_max_mask = power == maximum_filter(power, size=3)
+    detection_mask = cfar_mask & local_max_mask
+
+    # 提取候选点
+    candidate_indices = np.argwhere(detection_mask)
+    if candidate_indices.size == 0:
+        return []
+
     candidates: list[tuple[float, int, int]] = []
-    for pos in range(len(candidate_rows)):
-        angle_idx = angle_start + candidate_rows[pos]
-        range_idx = range_start + candidate_cols[pos]
-        cell_power = float(power[angle_idx, range_idx])
-        if cell_power <= 0.0:
-            continue
-        outer_a0 = angle_idx - angle_margin
-        outer_a1 = angle_idx + angle_margin + 1
-        guard_a0 = angle_idx - guard_angle
-        guard_a1 = angle_idx + guard_angle + 1
-        outer_r0 = range_idx - range_margin
-        outer_r1 = range_idx + range_margin + 1
-        guard_r0 = range_idx - guard_range
-        guard_r1 = range_idx + guard_range + 1
+    for angle_idx, range_idx in candidate_indices:
+        candidates.append((float(power[angle_idx, range_idx]), angle_idx, range_idx))
 
-        total_sum = _box_sum(integral, outer_a0, outer_a1, outer_r0, outer_r1)
-        guard_sum = _box_sum(integral, guard_a0, guard_a1, guard_r0, guard_r1)
-        total_count = (outer_a1 - outer_a0) * (outer_r1 - outer_r0)
-        guard_count = (guard_a1 - guard_a0) * (guard_r1 - guard_r0)
-        noise_count = total_count - guard_count
-        if noise_count <= 0:
-            continue
-        noise_power = max((total_sum - guard_sum) / noise_count, EPS)
-        if cell_power < noise_power * threshold_scale:
-            continue
-        local = power[
-            max(0, angle_idx - 1) : min(n_angles, angle_idx + 2),
-            max(0, range_idx - 1) : min(n_ranges, range_idx + 2),
-        ]
-        if cell_power < float(np.max(local)):
-            continue
-        candidates.append((cell_power, angle_idx, range_idx))
-
+    # ========== 排序 + 去重 ==========
     detections: list[CfarDetection] = []
     for cell_power, angle_idx, range_idx in sorted(candidates, reverse=True):
         range_m = float(ranges_m[range_idx])
