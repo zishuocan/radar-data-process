@@ -2,6 +2,8 @@
 
 统一的 FMCW 雷达 `.bin` 文件桌面处理程序,读取、测距、测距精度、测速、距离-多普勒和测角功能。
 
+详细参数说明见 [docs/parameters.md](docs/parameters.md)。
+
 ## 环境配置
 
 ### 方法一：conda（推荐）
