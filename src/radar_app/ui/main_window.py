@@ -782,6 +782,8 @@ class RadarApp:
             ("相位差均值(deg)", single.mean_delta_deg),
             ("相位法角度(deg)", single.phase_angle_deg),
             ("FFT 角度(deg)", single.angle_fft_angle_deg),
+            ("Capon 角度(deg)", single.capon_angle_deg),
+            ("Capon 快拍数", single.capon_snapshot_count),
             ("检测目标数", len(multi.detections)),
             ("虚拟通道", ",".join(map(str, single.virtual_channels))),
         ]
@@ -816,12 +818,17 @@ class RadarApp:
                      fontsize=10, color="#b3261e",
                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
 
-        ax_angle.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1)
+        ax_angle.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1, label="FFT")
+        if single.capon_spectrum_db.size:
+            ax_angle.plot(single.angle_axis_deg, single.capon_spectrum_db, color="#2e7d32", linewidth=1.1, label="Capon")
         ax_angle.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
+        if np.isfinite(single.capon_angle_deg):
+            ax_angle.axvline(single.capon_angle_deg, color="#2e7d32", linestyle=":", linewidth=1.0)
         ax_angle.set_title("角谱")
         ax_angle.set_xlabel("角度 (deg)")
         ax_angle.set_ylabel("相对功率 (dB)")
         ax_angle.grid(True, linestyle="--", alpha=0.3)
+        ax_angle.legend(loc="lower left", fontsize=8)
         ax_angle.text(0.97, 0.95, f"θ={single.angle_fft_angle_deg:.3f}°",
                       transform=ax_angle.transAxes, ha="right", va="top",
                       fontsize=10, color="#b3261e",
@@ -832,6 +839,11 @@ class RadarApp:
                           transform=ax_angle.transAxes, ha="right", va="top",
                           fontsize=9, color="#1565c0",
                           bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
+        if np.isfinite(single.capon_angle_deg):
+            ax_angle.text(0.97, 0.77, f"Caponθ={single.capon_angle_deg:.3f}°",
+                          transform=ax_angle.transAxes, ha="right", va="top",
+                          fontsize=9, color="#2e7d32",
+                          bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2e7d32", lw=0.8, alpha=0.9))
 
         extent = [
             float(multi.ranges_m[0]),
@@ -891,12 +903,17 @@ class RadarApp:
                     fontsize=11, color="#b3261e",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
         elif title == "角谱":
-            ax.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1)
+            ax.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1, label="FFT")
+            if single.capon_spectrum_db.size:
+                ax.plot(single.angle_axis_deg, single.capon_spectrum_db, color="#2e7d32", linewidth=1.1, label="Capon")
             ax.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
+            if np.isfinite(single.capon_angle_deg):
+                ax.axvline(single.capon_angle_deg, color="#2e7d32", linestyle=":", linewidth=1.0)
             ax.set_title("角谱")
             ax.set_xlabel("角度 (deg)")
             ax.set_ylabel("相对功率 (dB)")
             ax.grid(True, linestyle="--", alpha=0.3)
+            ax.legend(loc="lower left", fontsize=9)
             ax.text(0.97, 0.95, f"FFT θ={single.angle_fft_angle_deg:.3f}°",
                     transform=ax.transAxes, ha="right", va="top",
                     fontsize=11, color="#b3261e",
@@ -906,6 +923,11 @@ class RadarApp:
                         transform=ax.transAxes, ha="right", va="top",
                         fontsize=10, color="#1565c0",
                         bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
+            if np.isfinite(single.capon_angle_deg):
+                ax.text(0.97, 0.75, f"Capon θ={single.capon_angle_deg:.3f}°",
+                        transform=ax.transAxes, ha="right", va="top",
+                        fontsize=10, color="#2e7d32",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2e7d32", lw=0.8, alpha=0.9))
         elif title == "距离-角度图":
             extent = [
                 float(multi.ranges_m[0]), float(multi.ranges_m[-1]),
@@ -1037,6 +1059,7 @@ class RadarApp:
                 writer.writerow(["type", "range_m", "angle_deg", "value"])
                 writer.writerow(["single_phase", single.target_range_m, single.phase_angle_deg, single.mean_delta_deg])
                 writer.writerow(["single_fft", single.target_range_m, single.angle_fft_angle_deg, ""])
+                writer.writerow(["single_capon", single.target_range_m, single.capon_angle_deg, single.capon_snapshot_count])
                 for detection in multi.detections:
                     writer.writerow(["cfar", detection.range_m, detection.angle_deg, detection.relative_power_db])
             else:

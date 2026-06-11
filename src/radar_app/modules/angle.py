@@ -16,6 +16,8 @@ PHASE_BRIDGED_AZIMUTH_CHANNELS = {
     DEFAULT_AZIMUTH_CHANNELS,
     tuple(reversed(DEFAULT_AZIMUTH_CHANNELS)),
 }
+CAPON_RANGE_HALF_WINDOW_BINS = 1
+CAPON_DIAGONAL_LOADING = 0.05
 HRRP_DB_FLOOR = -60.0
 RANGE_ANGLE_DB_FLOOR = -55.0
 ANGLE_DB_FLOOR = -50.0
@@ -80,6 +82,9 @@ class SingleTargetResult:
     angle_axis_deg: np.ndarray
     angle_spectrum_db: np.ndarray
     angle_fft_angle_deg: float
+    capon_spectrum_db: np.ndarray
+    capon_angle_deg: float
+    capon_snapshot_count: int
 
 
 @dataclass
@@ -152,15 +157,14 @@ def compute_range_spectrum(
     window_name: str,
     chirp_choice: str,
     zero_padding_power: int,
-) -> tuple[np.ndarray, np.ndarray, int, str]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
     if virtual_cube.ndim != 3:
         raise ValueError("虚拟通道数据维度应为 channel/chirp/sample")
     if virtual_cube.shape[0] != REQUIRED_VIRTUAL_CHANNELS:
         raise ValueError(f"方位测角需要 {REQUIRED_VIRTUAL_CHANNELS} 个虚拟通道")
 
     chirp_indices, chirp_label = parse_chirp_indices(chirp_choice, virtual_cube.shape[1])
-    selected = virtual_cube[:, chirp_indices, :]
-    selected = selected.astype(np.complex128 if np.iscomplexobj(selected) else np.float64, copy=False)
+    selected = virtual_cube.astype(np.complex128 if np.iscomplexobj(virtual_cube) else np.float64, copy=False)
     selected = selected - np.mean(selected, axis=-1, keepdims=True)
     selected = selected * make_window(window_name, params.samples_per_chirp).reshape(1, 1, -1)
 
@@ -175,9 +179,9 @@ def compute_range_spectrum(
         spectrum = np.fft.rfft(selected, n=nfft, axis=-1)
         freqs = np.fft.rfftfreq(nfft, d=1.0 / params.sample_rate_hz)
 
-    range_spectrum = np.mean(spectrum, axis=1)
+    range_spectrum = np.mean(spectrum[:, chirp_indices, :], axis=1)
     ranges_m = C0 * freqs / (2.0 * params.slope_hz_s)
-    return ranges_m, range_spectrum, nfft, chirp_label
+    return ranges_m, range_spectrum, spectrum, nfft, chirp_label
 
 
 def compute_time_signal(virtual_cube: np.ndarray, chirp_choice: str) -> tuple[np.ndarray, str]:
@@ -249,6 +253,53 @@ def compute_angle_spectrum(
     spectrum_db = 10.0 * np.log10(np.maximum(power / max(power_max, EPS), 10.0 ** (ANGLE_DB_FLOOR / 10.0)))
     peak_index = int(np.argmax(power))
     return angle_axis_deg, spectrum_db, float(angle_axis_deg[peak_index]), nfft
+
+
+def steering_matrix(angle_axis_deg: np.ndarray, params: RadarParams, antenna_spacing_m: float, channel_count: int) -> np.ndarray:
+    phase_step = 2.0 * np.pi * antenna_spacing_m * np.sin(np.radians(angle_axis_deg)) / wavelength_m(params)
+    element_indices = np.arange(channel_count, dtype=np.float64).reshape(-1, 1)
+    return np.exp(1j * element_indices * phase_step.reshape(1, -1))
+
+
+def compute_capon_spectrum(
+    snapshot_spectrum: np.ndarray,
+    target_index: int,
+    angle_axis_deg: np.ndarray,
+    params: RadarParams,
+    antenna_spacing_m: float,
+    range_half_window_bins: int = CAPON_RANGE_HALF_WINDOW_BINS,
+    diagonal_loading: float = CAPON_DIAGONAL_LOADING,
+) -> tuple[np.ndarray, float, int]:
+    if snapshot_spectrum.ndim != 3 or angle_axis_deg.size == 0:
+        return np.full(angle_axis_deg.shape, ANGLE_DB_FLOOR, dtype=np.float64), float("nan"), 0
+
+    channel_count, _chirp_count, range_count = snapshot_spectrum.shape
+    start = max(0, target_index - max(0, int(range_half_window_bins)))
+    stop = min(range_count, target_index + max(0, int(range_half_window_bins)) + 1)
+    snapshots = snapshot_spectrum[:, :, start:stop].reshape(channel_count, -1)
+    snapshot_count = snapshots.shape[1]
+    if snapshot_count == 0:
+        return np.full(angle_axis_deg.shape, ANGLE_DB_FLOOR, dtype=np.float64), float("nan"), 0
+
+    covariance = snapshots @ snapshots.conj().T / snapshot_count
+    covariance = 0.5 * (covariance + covariance.conj().T)
+    mean_power = float(np.real(np.trace(covariance)) / max(channel_count, 1))
+    load_power = max(diagonal_loading * mean_power, EPS)
+    covariance = covariance + load_power * np.eye(channel_count, dtype=np.complex128)
+
+    try:
+        inverse_covariance = np.linalg.inv(covariance)
+    except np.linalg.LinAlgError:
+        inverse_covariance = np.linalg.pinv(covariance)
+
+    steering = steering_matrix(angle_axis_deg, params, antenna_spacing_m, channel_count)
+    denominator = np.real(np.sum(np.conj(steering) * (inverse_covariance @ steering), axis=0))
+    capon_power = 1.0 / np.maximum(denominator, EPS)
+    power_max = float(np.max(capon_power)) if capon_power.size else 0.0
+    spectrum_db = 10.0 * np.log10(np.maximum(capon_power / max(power_max, EPS), 10.0 ** (ANGLE_DB_FLOOR / 10.0)))
+    peak_index = int(np.argmax(capon_power)) if capon_power.size else 0
+    capon_angle = float(angle_axis_deg[peak_index]) if capon_power.size else float("nan")
+    return spectrum_db, capon_angle, int(snapshot_count)
 
 
 def virtual_array_phase_bridge_correction(
@@ -456,7 +507,7 @@ def analyze_single_target(
     angle_fft_size: int,
     phase_correction: np.ndarray | None = None,
 ) -> tuple[SingleTargetResult, np.ndarray]:
-    ranges_m, range_spectrum, nfft_range, chirp_label = compute_range_spectrum(
+    ranges_m, range_spectrum, snapshot_spectrum, nfft_range, chirp_label = compute_range_spectrum(
         virtual_cube,
         params,
         window_name,
@@ -467,10 +518,12 @@ def analyze_single_target(
         if phase_correction.shape[0] != range_spectrum.shape[0]:
             raise ValueError("0 度校准通道数与当前虚拟通道数不一致")
         range_spectrum = range_spectrum * phase_correction.reshape(-1, 1)
+        snapshot_spectrum = snapshot_spectrum * phase_correction.reshape(-1, 1, 1)
     hrrp_power, hrrp_db = hrrp_from_range_spectrum(range_spectrum)
     target_index = find_strongest_range_peak(ranges_m, hrrp_power, min_range_m, max_display_range_m)
     bridge_correction = virtual_array_phase_bridge_correction(range_spectrum[:, target_index], virtual_channels)
     range_spectrum = range_spectrum * bridge_correction.reshape(-1, 1)
+    snapshot_spectrum = snapshot_spectrum * bridge_correction.reshape(-1, 1, 1)
     channel_vector = range_spectrum[:, target_index]
     records, mean_delta_rad, mean_delta_deg = compute_channel_phase_records(channel_vector, virtual_channels)
     phase_angle_deg, phase_sin_argument = angle_from_phase_delta(mean_delta_rad, params, antenna_spacing_m)
@@ -479,6 +532,13 @@ def analyze_single_target(
         params,
         antenna_spacing_m,
         angle_fft_size,
+    )
+    capon_spectrum_db, capon_angle_deg, capon_snapshot_count = compute_capon_spectrum(
+        snapshot_spectrum,
+        target_index,
+        angle_axis_deg,
+        params,
+        antenna_spacing_m,
     )
     time_signal, time_chirp_label = compute_time_signal(virtual_cube, chirp_choice)
 
@@ -508,6 +568,9 @@ def analyze_single_target(
             angle_axis_deg=angle_axis_deg,
             angle_spectrum_db=angle_spectrum_db,
             angle_fft_angle_deg=angle_fft_angle_deg,
+            capon_spectrum_db=capon_spectrum_db,
+            capon_angle_deg=capon_angle_deg,
+            capon_snapshot_count=capon_snapshot_count,
         ),
         range_spectrum,
     )
