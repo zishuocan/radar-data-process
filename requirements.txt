@@ -1,0 +1,10 @@
+# Core scientific stack
+numpy
+matplotlib
+
+# GUI backend: tkinter ships with Python itself.
+# On conda, install via:  conda install tk
+# On Ubuntu/Debian Linux, install via:  sudo apt install python3-tk
+
+# Install this package itself (editable mode)
+# Run:  pip install -e .
