@@ -202,7 +202,7 @@ class RadarApp:
         self.rd_slow_time_var = tk.StringVar(value="天线xChirp")
         self.rd_suppress_var = tk.BooleanVar(value=True)
 
-        self.angle_channels_var = tk.StringVar(value="1,2,3,4,5,6,7,8")
+        self.angle_channels_var = tk.StringVar(value=",".join(map(str, angle.DEFAULT_AZIMUTH_CHANNELS)))
         self.angle_spacing_mm_var = tk.StringVar(value="2.0")
         self.angle_fft_var = tk.StringVar(value="256")
         self.angle_min_range_var = tk.StringVar(value="0.15")
@@ -475,6 +475,9 @@ class RadarApp:
             return
 
         self.loaded = loaded
+        self.current_result = None
+        self.current_module = ""
+        self.current_rows = []
         self._update_selectors()
         self.status_var.set(
             f"已读取 {path.name}: {loaded.frame_count} 帧, {loaded.antenna_count} 通道, "
@@ -497,7 +500,9 @@ class RadarApp:
         chirp_values = ["平均"] + [str(i) for i in range(1, chirp_count + 1)]
         self.chirp_box.configure(values=chirp_values)
         self.chirp_var.set("1")
-        if self.loaded.antenna_count >= 8:
+        if self.loaded.antenna_count >= 16:
+            self.angle_channels_var.set(",".join(map(str, angle.DEFAULT_AZIMUTH_CHANNELS)))
+        elif self.loaded.antenna_count >= 8:
             self.angle_channels_var.set(",".join(str(i) for i in range(1, 9)))
 
     def _ensure_loaded(self) -> LoadedRadarData:
@@ -742,10 +747,10 @@ class RadarApp:
         figure.colorbar(image, ax=ax, label="相对功率 (dB)")
         figure.tight_layout()
 
-    def _process_angle(self) -> None:
+    def _analyze_current_angle(self, phase_correction: np.ndarray | None) -> tuple[angle.SingleTargetResult, angle.MultiTargetResult, np.ndarray]:
         loaded = self._ensure_loaded()
         params = self._params()
-        single, multi, range_spectrum = angle.analyze_angle(
+        return angle.analyze_angle(
             loaded.data,
             params,
             frame_number=int(float(self.frame_var.get())),
@@ -765,7 +770,12 @@ class RadarApp:
             max_detections=int(float(self.angle_max_detections_var.get())),
             min_gap_m=float(self.angle_gap_m_var.get()),
             min_gap_deg=float(self.angle_gap_deg_var.get()),
-            phase_correction=self.calibration.phase_correction if self.calibration else None,
+            phase_correction=phase_correction,
+        )
+
+    def _process_angle(self) -> None:
+        single, multi, range_spectrum = self._analyze_current_angle(
+            self.calibration.phase_correction if self.calibration else None
         )
         rows = [
             ("单目标距离(m)", single.target_range_m),
@@ -926,12 +936,18 @@ class RadarApp:
         NavigationToolbar2Tk(canvas, popup, pack_toolbar=True).update()
 
     def build_angle_calibration(self) -> None:
-        if self.current_module != "angle" or not isinstance(self.current_result, tuple):
-            messagebox.showinfo("校准", "请先在测角模块处理一个 0 度校准文件")
+        if self.loaded is None:
+            messagebox.showinfo("校准", "请先读取一个 0 度校准文件")
             return
-        single, _multi, range_spectrum = self.current_result
+        try:
+            single, _multi, range_spectrum = self._analyze_current_angle(None)
+        except Exception as exc:
+            messagebox.showerror("校准失败", str(exc))
+            self.status_var.set(f"校准失败: {exc}")
+            return
         self.calibration = angle.build_phase_calibration(single, range_spectrum)
-        self.status_var.set(f"已建立测角校准: R={self.calibration.target_range_m:.4f} m")
+        self._process_angle()
+        self.status_var.set(f"已重新建立并应用测角校准: R={self.calibration.target_range_m:.4f} m")
 
     def _set_current(self, module: str, result: object, rows: list[tuple[str, object]]) -> None:
         self.current_module = module

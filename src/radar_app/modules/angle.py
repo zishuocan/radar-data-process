@@ -11,6 +11,11 @@ from radar_app.core.signal import EPS, make_window, next_fft_size
 
 
 REQUIRED_VIRTUAL_CHANNELS = 8
+DEFAULT_AZIMUTH_CHANNELS = (16, 15, 14, 13, 12, 11, 10, 9)
+PHASE_BRIDGED_AZIMUTH_CHANNELS = {
+    DEFAULT_AZIMUTH_CHANNELS,
+    tuple(reversed(DEFAULT_AZIMUTH_CHANNELS)),
+}
 HRRP_DB_FLOOR = -60.0
 RANGE_ANGLE_DB_FLOOR = -55.0
 ANGLE_DB_FLOOR = -50.0
@@ -246,6 +251,38 @@ def compute_angle_spectrum(
     return angle_axis_deg, spectrum_db, float(angle_axis_deg[peak_index]), nfft
 
 
+def virtual_array_phase_bridge_correction(
+    channel_vector: np.ndarray,
+    virtual_channels: tuple[int, ...],
+) -> np.ndarray:
+    correction = np.ones(channel_vector.shape, dtype=np.complex128)
+    if tuple(virtual_channels) not in PHASE_BRIDGED_AZIMUTH_CHANNELS:
+        return correction
+    if channel_vector.size != REQUIRED_VIRTUAL_CHANNELS:
+        return correction
+
+    phases = np.unwrap(np.angle(channel_vector))
+    amplitudes = np.abs(channel_vector)
+    deltas = np.diff(phases)
+    in_group_delta_indices = np.array([0, 1, 2, 4, 5, 6], dtype=int)
+    in_group_deltas = deltas[in_group_delta_indices]
+    pair_amplitudes = np.minimum(amplitudes[:-1], amplitudes[1:])[in_group_delta_indices]
+    valid = np.isfinite(in_group_deltas) & (pair_amplitudes > 0.05 * amplitudes.max(initial=0.0))
+    if np.count_nonzero(valid) < 2:
+        valid = np.isfinite(in_group_deltas)
+    if np.count_nonzero(valid) < 2:
+        return correction
+
+    expected_delta = float(np.median(in_group_deltas[valid]))
+    bridge_delta = float(deltas[3])
+    if not np.isfinite(expected_delta) or not np.isfinite(bridge_delta):
+        return correction
+
+    bridge_error = bridge_delta - expected_delta
+    correction[4:] = np.exp(-1j * bridge_error)
+    return correction
+
+
 def compute_channel_phase_records(
     channel_vector: np.ndarray,
     virtual_channels: tuple[int, ...],
@@ -432,6 +469,8 @@ def analyze_single_target(
         range_spectrum = range_spectrum * phase_correction.reshape(-1, 1)
     hrrp_power, hrrp_db = hrrp_from_range_spectrum(range_spectrum)
     target_index = find_strongest_range_peak(ranges_m, hrrp_power, min_range_m, max_display_range_m)
+    bridge_correction = virtual_array_phase_bridge_correction(range_spectrum[:, target_index], virtual_channels)
+    range_spectrum = range_spectrum * bridge_correction.reshape(-1, 1)
     channel_vector = range_spectrum[:, target_index]
     records, mean_delta_rad, mean_delta_deg = compute_channel_phase_records(channel_vector, virtual_channels)
     phase_angle_deg, phase_sin_argument = angle_from_phase_delta(mean_delta_rad, params, antenna_spacing_m)
