@@ -25,6 +25,88 @@ from radar_app.core import FORMAT_OPTIONS, WINDOW_OPTIONS, LoadedRadarData, Rada
 from radar_app.modules import angle, range_hrrp, range_precision, speed
 
 
+class ToolTip:
+    """鼠标悬停浮窗提示，400ms 延迟，浅黄半透明，智能定位"""
+
+    _active_tip: ToolTip | None = None
+
+    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 400) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.tip_window: tk.Toplevel | None = None
+        self._after_id: str | None = None
+        widget.bind("<Enter>", self._schedule, add=True)
+        widget.bind("<Leave>", self._on_leave, add=True)
+        widget.bind("<Button-1>", self._hide, add=True)
+        widget.bind("<Destroy>", self._on_destroy, add=True)
+
+    def _schedule(self, event: tk.Event | None = None) -> None:
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _show(self) -> None:
+        if self._active_tip is not None and self._active_tip is not self:
+            self._active_tip._hide()
+        ToolTip._active_tip = self
+
+        wx = self.widget.winfo_rootx()
+        wy = self.widget.winfo_rooty()
+        wh = self.widget.winfo_height()
+
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_attributes("-topmost", True)
+
+        label = tk.Label(
+            self.tip_window,
+            text=self.text,
+            justify=tk.LEFT,
+            wraplength=420,
+            font=("Microsoft YaHei", 9),
+            bg="#ffffe0",
+            fg="#333333",
+            padx=8,
+            pady=5,
+        )
+        label.pack()
+
+        self.tip_window.update_idletasks()
+        tw = self.tip_window.winfo_reqwidth()
+        th = self.tip_window.winfo_reqheight()
+        sw = self.widget.winfo_screenwidth()
+        sh = self.widget.winfo_screenheight()
+
+        x = wx
+        y = wy + wh + 2
+        if x + tw > sw:
+            x = sw - tw - 4
+        if y + th > sh:
+            y = wy - th - 2
+        self.tip_window.wm_geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _on_leave(self, event: tk.Event | None = None) -> None:
+        self._hide()
+
+    def _hide(self) -> None:
+        if self._after_id:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if self.tip_window:
+            try:
+                self.tip_window.destroy()
+            except Exception:
+                pass
+            self.tip_window = None
+        if ToolTip._active_tip is self:
+            ToolTip._active_tip = None
+
+    def _on_destroy(self, event: tk.Event | None = None) -> None:
+        self._hide()
+
+
 class ResultPane:
     def __init__(self, parent: ttk.Frame, figsize: tuple[float, float] = (9.8, 5.8)) -> None:
         parent.rowconfigure(1, weight=1)
@@ -152,40 +234,49 @@ class RadarApp:
             common.columnconfigure(col, weight=1 if col in {1, 3, 5, 7, 9} else 0)
 
         ttk.Label(common, text="bin 文件").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(common, textvariable=self.file_var).grid(row=0, column=1, columnspan=7, sticky=tk.EW, padx=6, pady=4)
-        ttk.Button(common, text="选择", command=self.choose_file).grid(row=0, column=8, sticky=tk.EW, padx=6, pady=4)
-        ttk.Button(common, text="读取", command=self.load_file).grid(row=0, column=9, sticky=tk.EW, padx=6, pady=4)
+        _e = ttk.Entry(common, textvariable=self.file_var)
+        _e.grid(row=0, column=1, columnspan=7, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_e, "待处理的雷达原始数据文件（.bin 格式）\n点击右侧“选择”按钮选取文件")
+        _b = ttk.Button(common, text="选择", command=self.choose_file)
+        _b.grid(row=0, column=8, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_b, "浏览并选择要处理的 .bin 文件")
+        _b = ttk.Button(common, text="读取", command=self.load_file)
+        _b.grid(row=0, column=9, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_b, "读取当前路径的 bin 文件并解析数据")
 
         fields = [
-            ("起始频率(GHz)", self.start_freq_var),
-            ("斜率(MHz/us)", self.slope_var),
-            ("采样率(ksps)", self.sample_rate_var),
-            ("采样点", self.samples_var),
-            ("Chirp/帧", self.chirps_var),
-            ("帧周期(ms)", self.frame_period_var),
+            ("起始频率(GHz)", self.start_freq_var, "FMCW 起始频率（75 GHz 典型值）\n对应波长 λ ≈ 4 mm"),
+            ("斜率(MHz/us)", self.slope_var, "Chirp 调频斜率（30 MHz/μs 典型值）\n影响带宽和距离分辨率"),
+            ("采样率(ksps)", self.sample_rate_var, "ADC 采样率（3000 ksps 典型值）\n决定最大无模糊距离"),
+            ("采样点", self.samples_var, "每 Chirp 的采样点数（256 典型值）\n与距离分辨率直接相关"),
+            ("Chirp/帧", self.chirps_var, "每帧包含的 Chirp 数量（8 典型值）\n影响多普勒处理能力"),
+            ("帧周期(ms)", self.frame_period_var, "相邻两帧的时间间隔（500 ms 典型值）\n影响测速的时间分辨率"),
         ]
-        for idx, (label, var) in enumerate(fields):
+        for idx, (label, var, tip) in enumerate(fields):
             row = 1 + idx // 3
             col = (idx % 3) * 2
             ttk.Label(common, text=label).grid(row=row, column=col, sticky=tk.W, padx=6, pady=4)
-            ttk.Entry(common, textvariable=var, width=12).grid(row=row, column=col + 1, sticky=tk.EW, padx=6, pady=4)
+            _e = ttk.Entry(common, textvariable=var, width=12)
+            _e.grid(row=row, column=col + 1, sticky=tk.EW, padx=6, pady=4)
+            ToolTip(_e, tip)
 
         ttk.Label(common, text="数据格式").grid(row=1, column=6, sticky=tk.W, padx=6, pady=4)
         self.format_box = ttk.Combobox(common, textvariable=self.format_var, values=FORMAT_OPTIONS, state="readonly", width=18)
         self.format_box.grid(row=1, column=7, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(self.format_box, "bin 文件中雷达数据的存储格式\n选择“自动”可智能识别")
         ttk.Label(common, text="文件头(bytes)").grid(row=1, column=8, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(common, textvariable=self.header_var, width=12).grid(row=1, column=9, sticky=tk.EW, padx=6, pady=4)
+        _e = ttk.Entry(common, textvariable=self.header_var, width=12)
+        _e.grid(row=1, column=9, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_e, "文件头字节数\n选择“自动”可自动检测\n常见值：0、248")
 
         ttk.Label(common, text="窗函数").grid(row=2, column=6, sticky=tk.W, padx=6, pady=4)
-        ttk.Combobox(common, textvariable=self.window_var, values=WINDOW_OPTIONS, state="readonly", width=12).grid(
-            row=2,
-            column=7,
-            sticky=tk.EW,
-            padx=6,
-            pady=4,
-        )
+        _c = ttk.Combobox(common, textvariable=self.window_var, values=WINDOW_OPTIONS, state="readonly", width=12)
+        _c.grid(row=2, column=7, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_c, "FFT 前加窗类型\n• rect：矩形（无加窗）\n• hamming：汉明窗（默认）\n• hann：汉宁窗\n• blackman：布莱克曼窗\n• flattop：平顶窗")
         ttk.Label(common, text="补零幂").grid(row=2, column=8, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(common, textvariable=self.zero_padding_var, width=12).grid(row=2, column=9, sticky=tk.EW, padx=6, pady=4)
+        _e = ttk.Entry(common, textvariable=self.zero_padding_var, width=12)
+        _e.grid(row=2, column=9, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_e, "FFT 补零倍数控制\nFFT 点数=2^(ceil(log2(N)) + 补零幂)\n补零幂=5 时 256 点→8192 点\n越大频谱越平滑，计算量越大")
 
         selectors = ttk.Frame(outer)
         selectors.grid(row=1, column=0, sticky=tk.EW, pady=(0, 8))
@@ -193,15 +284,24 @@ class RadarApp:
         ttk.Label(selectors, text="帧").grid(row=0, column=0, sticky=tk.W)
         self.frame_spin = ttk.Spinbox(selectors, textvariable=self.frame_var, from_=1, to=1, width=8)
         self.frame_spin.grid(row=0, column=1, padx=(4, 14))
+        ToolTip(self.frame_spin, "选择要处理第几帧数据\n读取文件后根据实际帧数自动调整上限")
         ttk.Label(selectors, text="天线").grid(row=0, column=2, sticky=tk.W)
         self.antenna_box = ttk.Combobox(selectors, textvariable=self.antenna_var, values=["1"], state="readonly", width=10)
         self.antenna_box.grid(row=0, column=3, padx=(4, 14))
+        ToolTip(self.antenna_box, "选择天线通道\n可选“平均”或指定某一天线")
         ttk.Label(selectors, text="Chirp").grid(row=0, column=4, sticky=tk.W)
         self.chirp_box = ttk.Combobox(selectors, textvariable=self.chirp_var, values=["1"], state="readonly", width=10)
         self.chirp_box.grid(row=0, column=5, padx=(4, 14))
-        ttk.Button(selectors, text="处理当前模块", command=self.process_current_tab).grid(row=0, column=6, padx=(0, 8))
-        ttk.Button(selectors, text="保存当前结果", command=self.save_current_result).grid(row=0, column=7, padx=(0, 8))
-        ttk.Button(selectors, text="设为测角校准", command=self.build_angle_calibration).grid(row=0, column=8, padx=(0, 8))
+        ToolTip(self.chirp_box, "选择 Chirp 序号\n可选“平均”或指定某个 Chirp")
+        _b = ttk.Button(selectors, text="处理当前模块", command=self.process_current_tab)
+        _b.grid(row=0, column=6, padx=(0, 8))
+        ToolTip(_b, "使用当前参数运行选中标签页的算法")
+        _b = ttk.Button(selectors, text="保存当前结果", command=self.save_current_result)
+        _b.grid(row=0, column=7, padx=(0, 8))
+        ToolTip(_b, "将当前模块的结果导出为 PNG 图片和 CSV 数据")
+        _b = ttk.Button(selectors, text="设为测角校准", command=self.build_angle_calibration)
+        _b.grid(row=0, column=8, padx=(0, 8))
+        ToolTip(_b, "将当前测角结果保存为 0° 相位校准数据\n后续测角时自动补偿通道间相位差")
         ttk.Label(selectors, textvariable=self.status_var).grid(row=0, column=9, columnspan=3, sticky=tk.EW)
 
         self.tabs = ttk.Notebook(outer)
@@ -232,88 +332,111 @@ class RadarApp:
         self.panes[key] = pane
         return tab, controls, pane
 
-    def _field(self, parent: ttk.Frame, row: int, col: int, label: str, var: tk.Variable, width: int = 10) -> None:
+    def _field(self, parent: ttk.Frame, row: int, col: int, label: str, var: tk.Variable, width: int = 10, tip: str | None = None) -> ttk.Entry:
         ttk.Label(parent, text=label).grid(row=row, column=col, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(parent, textvariable=var, width=width).grid(row=row, column=col + 1, sticky=tk.EW, padx=6, pady=4)
+        entry = ttk.Entry(parent, textvariable=var, width=width)
+        entry.grid(row=row, column=col + 1, sticky=tk.EW, padx=6, pady=4)
+        if tip:
+            ToolTip(entry, tip)
+        return entry
 
     def _add_hrrp_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("hrrp", "测距 / HRRP")
-        self._field(controls, 0, 0, "截取比例", self.hrrp_keep_var)
-        self._field(controls, 0, 2, "目标数", self.hrrp_target_count_var)
-        self._field(controls, 0, 4, "忽略近端(m)", self.hrrp_min_range_var)
-        self._field(controls, 0, 6, "目标间隔(m)", self.hrrp_min_gap_var)
+        self._field(controls, 0, 0, "截取比例", self.hrrp_keep_var,
+                    tip="截取 chirp 前段的比例（0~1）\n1.0 = 使用全部采样点\n0.5 = 只使用前一半")
+        self._field(controls, 0, 2, "目标数", self.hrrp_target_count_var,
+                    tip="最多检测的目标数量\n按幅度从大到小排序")
+        self._field(controls, 0, 4, "忽略近端(m)", self.hrrp_min_range_var,
+                    tip="忽略该距离以内的峰值\n用于消除近场强杂波的干扰")
+        self._field(controls, 0, 6, "目标间隔(m)", self.hrrp_min_gap_var,
+                    tip="两个不同目标之间的最小距离间隔\n小于此间隔的峰值视为同一目标")
 
     def _add_precision_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("precision", "测距精度")
-        self._field(controls, 0, 0, "忽略近端(m)", self.precision_min_range_var)
-        self._field(controls, 0, 2, "噪声最大距离(m)", self.precision_noise_max_var)
-        self._field(controls, 0, 4, "保护单元", self.precision_guard_bins_var)
+        self._field(controls, 0, 0, "忽略近端(m)", self.precision_min_range_var,
+                    tip="目标搜索起始距离\n忽略该距离以内的峰值")
+        self._field(controls, 0, 2, "噪声最大距离(m)", self.precision_noise_max_var,
+                    tip="噪声功率估计的距离上限\n留空自动使用最大距离")
+        self._field(controls, 0, 4, "保护单元", self.precision_guard_bins_var,
+                    tip="目标 3dB 主瓣外的保护单元数\n防止目标能量泄漏到噪声估计中")
         ttk.Label(controls, text="全带宽窗").grid(row=0, column=6, sticky=tk.W, padx=6, pady=4)
-        ttk.Combobox(controls, textvariable=self.precision_full_window_var, values=WINDOW_OPTIONS, state="readonly", width=10).grid(
-            row=0,
-            column=7,
-            sticky=tk.EW,
-            padx=6,
-            pady=4,
-        )
+        _c = ttk.Combobox(controls, textvariable=self.precision_full_window_var, values=WINDOW_OPTIONS, state="readonly", width=10)
+        _c.grid(row=0, column=7, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_c, "全带宽配置（keep_ratio=1.0）使用的窗函数")
         ttk.Label(controls, text="半带宽窗").grid(row=0, column=8, sticky=tk.W, padx=6, pady=4)
-        ttk.Combobox(controls, textvariable=self.precision_half_window_var, values=WINDOW_OPTIONS, state="readonly", width=10).grid(
-            row=0,
-            column=9,
-            sticky=tk.EW,
-            padx=6,
-            pady=4,
-        )
+        _c = ttk.Combobox(controls, textvariable=self.precision_half_window_var, values=WINDOW_OPTIONS, state="readonly", width=10)
+        _c.grid(row=0, column=9, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_c, "半带宽配置（keep_ratio=0.5）使用的窗函数\n与全带宽对比展示带宽对精度的影响")
 
     def _add_speed_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("speed", "测速")
-        self._field(controls, 0, 0, "最小距离(m)", self.speed_min_range_var)
-        self._field(controls, 0, 2, "最大距离(m)", self.speed_max_range_var)
-        self._field(controls, 0, 4, "最大跳变(m/帧)", self.speed_max_jump_var)
-        self._field(controls, 0, 6, "置信阈值(dB)", self.speed_margin_var)
-        self._field(controls, 0, 8, "平滑帧数", self.speed_smooth_var)
-        ttk.Checkbutton(controls, text="静态抑制", variable=self.speed_suppress_var).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=6)
-        ttk.Checkbutton(controls, text="优先接近目标", variable=self.speed_prefer_approach_var).grid(
-            row=1,
-            column=2,
-            columnspan=2,
-            sticky=tk.W,
-            padx=6,
-        )
+        self._field(controls, 0, 0, "最小距离(m)", self.speed_min_range_var,
+                    tip="目标搜索的起始距离\n排除近场杂波")
+        self._field(controls, 0, 2, "最大距离(m)", self.speed_max_range_var,
+                    tip="目标搜索的最大距离\n应覆盖目标运动范围")
+        self._field(controls, 0, 4, "最大跳变(m/帧)", self.speed_max_jump_var,
+                    tip="相邻帧间目标最大移动距离\n用于约束轨迹跟踪的搜索范围")
+        self._field(controls, 0, 6, "置信阈值(dB)", self.speed_margin_var,
+                    tip="峰值相对于噪声基底的最小信噪比\n低于此阈值的帧将被标记为无效")
+        self._field(controls, 0, 8, "平滑帧数", self.speed_smooth_var,
+                    tip="轨迹平滑的滑动窗口大小\n越大曲线越平滑，但响应越迟钝")
+        _ck = ttk.Checkbutton(controls, text="静态抑制", variable=self.speed_suppress_var)
+        _ck.grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=6)
+        ToolTip(_ck, "启用后减去所有帧的均值\n可抑制静止物体的杂波\n运动目标会保留")
+        _ck = ttk.Checkbutton(controls, text="优先接近目标", variable=self.speed_prefer_approach_var)
+        _ck.grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=6)
+        ToolTip(_ck, "启用后在轨迹跟踪中偏向距离减小的方向\n适合追踪正在靠近的目标")
 
     def _add_range_doppler_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("range_doppler", "距离-多普勒")
-        self._field(controls, 0, 0, "RD 帧", self.rd_frame_var)
-        self._field(controls, 0, 2, "最小距离(m)", self.rd_min_range_var)
-        self._field(controls, 0, 4, "最大距离(m)", self.rd_max_range_var)
-        self._field(controls, 0, 6, "Chirp 周期(us)", self.rd_chirp_period_var)
-        self._field(controls, 0, 8, "Doppler FFT", self.rd_fft_var)
-        self._field(controls, 1, 0, "速度范围(m/s)", self.rd_speed_limit_var)
+        self._field(controls, 0, 0, "RD 帧", self.rd_frame_var,
+                    tip="选取第几帧数据做距离-多普勒分析")
+        self._field(controls, 0, 2, "最小距离(m)", self.rd_min_range_var,
+                    tip="距离-多普勒图显示的最小距离")
+        self._field(controls, 0, 4, "最大距离(m)", self.rd_max_range_var,
+                    tip="距离-多普勒图显示的最大距离")
+        self._field(controls, 0, 6, "Chirp 周期(us)", self.rd_chirp_period_var,
+                    tip="单个 Chirp 的持续时间（微秒）\n用于计算多普勒频率和速度")
+        self._field(controls, 0, 8, "Doppler FFT", self.rd_fft_var,
+                    tip="多普勒维 FFT 点数\n点数越大速度分辨率越高")
+        self._field(controls, 1, 0, "速度范围(m/s)", self.rd_speed_limit_var,
+                    tip="速度显示范围 ±X m/s\n限制显示范围可突出低速目标")
         ttk.Label(controls, text="慢时间").grid(row=1, column=2, sticky=tk.W, padx=6, pady=4)
-        ttk.Combobox(controls, textvariable=self.rd_slow_time_var, values=speed.SLOW_TIME_OPTIONS, state="readonly", width=14).grid(
-            row=1,
-            column=3,
-            sticky=tk.EW,
-            padx=6,
-            pady=4,
-        )
-        ttk.Checkbutton(controls, text="静态抑制", variable=self.rd_suppress_var).grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=6)
+        _c = ttk.Combobox(controls, textvariable=self.rd_slow_time_var, values=speed.SLOW_TIME_OPTIONS, state="readonly", width=14)
+        _c.grid(row=1, column=3, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_c, "慢时间维度的组织方式\n• 天线xChirp：将天线和 chirp 都作为慢时间\n• Chirp：只将 chirp 作为慢时间")
+        _ck = ttk.Checkbutton(controls, text="静态抑制", variable=self.rd_suppress_var)
+        _ck.grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=6)
+        ToolTip(_ck, "启用后减去慢时间均值\n可抑制静止物体的多普勒信号")
 
     def _add_angle_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("angle", "测角")
-        self._field(controls, 0, 0, "虚拟通道", self.angle_channels_var, width=22)
-        self._field(controls, 0, 2, "阵元间距(mm)", self.angle_spacing_mm_var)
-        self._field(controls, 0, 4, "方位 FFT", self.angle_fft_var)
-        self._field(controls, 0, 6, "忽略近端(m)", self.angle_min_range_var)
-        self._field(controls, 0, 8, "显示最大距离(m)", self.angle_max_range_var)
-        self._field(controls, 1, 0, "CFAR 距离间隔(m)", self.angle_gap_m_var)
-        self._field(controls, 1, 2, "CFAR 角度间隔(度)", self.angle_gap_deg_var)
-        self._field(controls, 1, 4, "最大目标数", self.angle_max_detections_var)
-        self._field(controls, 1, 6, "训练距/保护距", self.angle_train_range_var)
-        self._field(controls, 1, 8, "训练角/保护角", self.angle_train_angle_var)
-        self._field(controls, 2, 0, "保护距", self.angle_guard_range_var)
-        self._field(controls, 2, 2, "保护角", self.angle_guard_angle_var)
-        self._field(controls, 2, 4, "阈值(dB)", self.angle_threshold_var)
+        self._field(controls, 0, 0, "虚拟通道", self.angle_channels_var, width=22,
+                    tip="8 个虚拟通道编号，用逗号分隔\n例：1,2,3,4,5,6,7,8")
+        self._field(controls, 0, 2, "阵元间距(mm)", self.angle_spacing_mm_var,
+                    tip="相邻虚拟天线阵元的物理间距（毫米）\n影响角度测量范围和分辨率")
+        self._field(controls, 0, 4, "方位 FFT", self.angle_fft_var,
+                    tip="方位角 FFT 点数\n越大角度分辨率越高")
+        self._field(controls, 0, 6, "忽略近端(m)", self.angle_min_range_var,
+                    tip="角度测量忽略该距离以内的目标\n用于排除近场干扰")
+        self._field(controls, 0, 8, "显示最大距离(m)", self.angle_max_range_var,
+                    tip="距离-角度图的最大显示距离")
+        self._field(controls, 1, 0, "CFAR 距离间隔(m)", self.angle_gap_m_var,
+                    tip="CFAR 多目标检测中\n两个目标间的最小距离间隔")
+        self._field(controls, 1, 2, "CFAR 角度间隔(度)", self.angle_gap_deg_var,
+                    tip="CFAR 多目标检测中\n两个目标间的最小角度间隔")
+        self._field(controls, 1, 4, "最大目标数", self.angle_max_detections_var,
+                    tip="CFAR 最多检测的目标数量")
+        self._field(controls, 1, 6, "训练距/保护距", self.angle_train_range_var,
+                    tip="CFAR 距离维训练单元数\n用于估计局部噪声功率")
+        self._field(controls, 1, 8, "训练角/保护角", self.angle_train_angle_var,
+                    tip="CFAR 角度维训练单元数")
+        self._field(controls, 2, 0, "保护距", self.angle_guard_range_var,
+                    tip="CFAR 距离维保护单元数\n防止目标能量泄漏到噪声估计中")
+        self._field(controls, 2, 2, "保护角", self.angle_guard_angle_var,
+                    tip="CFAR 角度维保护单元数")
+        self._field(controls, 2, 4, "阈值(dB)", self.angle_threshold_var,
+                    tip="CFAR 检测门限（dB）\n越低检测灵敏度越高，虚警也越多\n0 表示自适应门限")
 
     def _draw_empty(self) -> None:
         for pane in self.panes.values():
