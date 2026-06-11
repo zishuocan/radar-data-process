@@ -156,7 +156,10 @@ class RadarApp:
         self.current_result: object | None = None
         self.current_module = ""
         self.current_rows: list[tuple[str, object]] = []
+        self.module_results: dict[str, object] = {}
         self.calibration: angle.CalibrationResult | None = None
+        self.rd_is_playing = False
+        self.rd_play_after_id: str | None = None
 
         self.file_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="请选择 bin 文件")
@@ -194,6 +197,7 @@ class RadarApp:
         self.speed_prefer_approach_var = tk.BooleanVar(value=False)
 
         self.rd_frame_var = tk.StringVar(value="1")
+        self.rd_play_speed_var = tk.StringVar(value="2")
         self.rd_min_range_var = tk.StringVar(value="0.1")
         self.rd_max_range_var = tk.StringVar(value="12.0")
         self.rd_chirp_period_var = tk.StringVar(value="100")
@@ -329,6 +333,7 @@ class RadarApp:
         body = ttk.Frame(tab)
         body.grid(row=1, column=0, sticky=tk.NSEW)
         pane = ResultPane(body)
+        pane.canvas.mpl_connect("button_press_event", lambda event, module=key: self._on_plot_popup(event, module))
         self.panes[key] = pane
         return tab, controls, pane
 
@@ -408,6 +413,16 @@ class RadarApp:
         _ck = ttk.Checkbutton(controls, text="静态抑制", variable=self.rd_suppress_var)
         _ck.grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=6)
         ToolTip(_ck, "启用后减去慢时间均值\n可抑制静止物体的多普勒信号")
+        ttk.Label(controls, text="播放速度(fps)").grid(row=1, column=6, sticky=tk.W, padx=6, pady=4)
+        _e = ttk.Entry(controls, textvariable=self.rd_play_speed_var, width=10)
+        _e.grid(row=1, column=7, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_e, "距离-多普勒图按 RD 帧顺序播放的速度\n例如 2 表示每秒处理 2 帧")
+        self.rd_play_button = ttk.Button(controls, text="播放", command=self.toggle_rd_playback)
+        self.rd_play_button.grid(row=1, column=8, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(self.rd_play_button, "从当前 RD 帧开始顺序播放距离-多普勒图")
+        _b = ttk.Button(controls, text="停止", command=self.stop_rd_playback)
+        _b.grid(row=1, column=9, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_b, "停止距离-多普勒图播放并保留当前 RD 帧")
 
     def _add_angle_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("angle", "测角")
@@ -465,6 +480,7 @@ class RadarApp:
         return params
 
     def load_file(self) -> None:
+        self.stop_rd_playback(update_status=False)
         try:
             path = Path(self.file_var.get())
             params = self._params()
@@ -478,6 +494,7 @@ class RadarApp:
         self.current_result = None
         self.current_module = ""
         self.current_rows = []
+        self.module_results.clear()
         self._update_selectors()
         self.status_var.set(
             f"已读取 {path.name}: {loaded.frame_count} 帧, {loaded.antenna_count} 通道, "
@@ -531,6 +548,91 @@ class RadarApp:
         except Exception as exc:
             messagebox.showerror("处理失败", str(exc))
             self.status_var.set(f"处理失败: {exc}")
+
+    def toggle_rd_playback(self) -> None:
+        if self.rd_is_playing:
+            self.stop_rd_playback()
+        else:
+            self.start_rd_playback()
+
+    def start_rd_playback(self) -> None:
+        try:
+            loaded = self._ensure_loaded()
+            self._rd_playback_fps()
+        except Exception as exc:
+            messagebox.showerror("播放失败", str(exc))
+            self.status_var.set(f"播放失败: {exc}")
+            return
+
+        frame_count = max(1, loaded.frame_count)
+        frame_number = self._clamped_frame_number(self.rd_frame_var.get(), frame_count)
+        if frame_number >= frame_count:
+            frame_number = 1
+
+        self.rd_is_playing = True
+        self.rd_play_button.configure(text="暂停")
+        self._rd_playback_step(frame_number)
+
+    def stop_rd_playback(self, update_status: bool = True) -> None:
+        if self.rd_play_after_id is not None:
+            try:
+                self.root.after_cancel(self.rd_play_after_id)
+            except Exception:
+                pass
+            self.rd_play_after_id = None
+        was_playing = self.rd_is_playing
+        self.rd_is_playing = False
+        play_button = getattr(self, "rd_play_button", None)
+        if play_button is not None:
+            play_button.configure(text="播放")
+        if update_status and was_playing:
+            self.status_var.set(f"已停止距离-多普勒播放，当前 RD 帧 {self.rd_frame_var.get()}")
+
+    def _rd_playback_fps(self) -> float:
+        fps = float(self.rd_play_speed_var.get())
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError("播放速度必须是大于 0 的数字")
+        return min(fps, 60.0)
+
+    @staticmethod
+    def _clamped_frame_number(text: str, frame_count: int) -> int:
+        try:
+            frame_number = int(float(text))
+        except ValueError:
+            frame_number = 1
+        return max(1, min(max(1, frame_count), frame_number))
+
+    def _rd_playback_step(self, frame_number: int) -> None:
+        if not self.rd_is_playing or self.loaded is None:
+            return
+        self.rd_play_after_id = None
+        try:
+            fps = self._rd_playback_fps()
+        except Exception as exc:
+            self.stop_rd_playback(update_status=False)
+            messagebox.showerror("播放失败", str(exc))
+            self.status_var.set(f"播放失败: {exc}")
+            return
+
+        frame_count = max(1, self.loaded.frame_count)
+        frame_number = self._clamped_frame_number(str(frame_number), frame_count)
+        self.rd_frame_var.set(str(frame_number))
+        try:
+            self._process_range_doppler()
+        except Exception as exc:
+            self.stop_rd_playback(update_status=False)
+            messagebox.showerror("处理失败", str(exc))
+            self.status_var.set(f"处理失败: {exc}")
+            return
+
+        self.status_var.set(f"距离-多普勒播放中: RD 帧 {frame_number} / {frame_count}, {fps:g} fps")
+        if frame_number >= frame_count:
+            self.stop_rd_playback(update_status=False)
+            self.status_var.set(f"距离-多普勒播放完成: 共 {frame_count} 帧")
+            return
+
+        delay_ms = max(20, int(round(1000.0 / fps)))
+        self.rd_play_after_id = self.root.after(delay_ms, lambda: self._rd_playback_step(frame_number + 1))
 
     def _antenna_number(self) -> int:
         text = self.antenna_var.get().strip()
@@ -628,17 +730,21 @@ class RadarApp:
         figure.clear()
         axes = figure.subplots(len(results), 1, squeeze=False)
         for ax, result in zip(axes.ravel(), results):
-            hrrp = result.hrrp
-            ax.plot(hrrp.ranges_m, hrrp.hrrp_db, color="#1565c0", linewidth=1.1)
-            ax.axvspan(result.target_left_m, result.target_right_m, color="#ef6c00", alpha=0.16)
-            ax.axvline(result.target_range_m, color="#b3261e", linestyle="--", linewidth=1.0)
-            ax.plot(result.target_range_m, hrrp.hrrp_db[result.peak_index], "v", color="#b3261e")
-            ax.set_title(f"{result.case.label}: R={result.target_range_m:.3f} m, SNR={result.snr_db:.2f} dB")
-            ax.set_xlabel("距离 (m)")
-            ax.set_ylabel("幅度 (dB)")
-            ax.set_ylim(range_precision.HRRP_DB_FLOOR, 4)
-            ax.grid(True, linestyle="--", alpha=0.35)
+            self._plot_precision_result(ax, result)
         figure.tight_layout()
+
+    @staticmethod
+    def _plot_precision_result(ax: matplotlib.axes.Axes, result: range_precision.PrecisionResult) -> None:
+        hrrp = result.hrrp
+        ax.plot(hrrp.ranges_m, hrrp.hrrp_db, color="#1565c0", linewidth=1.1)
+        ax.axvspan(result.target_left_m, result.target_right_m, color="#ef6c00", alpha=0.16)
+        ax.axvline(result.target_range_m, color="#b3261e", linestyle="--", linewidth=1.0)
+        ax.plot(result.target_range_m, hrrp.hrrp_db[result.peak_index], "v", color="#b3261e")
+        ax.set_title(f"{result.case.label}: R={result.target_range_m:.3f} m, SNR={result.snr_db:.2f} dB")
+        ax.set_xlabel("距离 (m)")
+        ax.set_ylabel("幅度 (dB)")
+        ax.set_ylim(range_precision.HRRP_DB_FLOOR, 4)
+        ax.grid(True, linestyle="--", alpha=0.35)
 
     def _process_speed(self) -> None:
         loaded = self._ensure_loaded()
@@ -676,27 +782,35 @@ class RadarApp:
     def _plot_speed(self, figure: Figure, result: speed.SpeedAnalysisResult) -> None:
         figure.clear()
         ax1, ax2 = figure.subplots(2, 1)
+        self._plot_speed_heatmap(ax1, result)
+        self._plot_speed_estimate(ax2, result)
+        figure.tight_layout()
+
+    @staticmethod
+    def _plot_speed_heatmap(ax: matplotlib.axes.Axes, result: speed.SpeedAnalysisResult) -> None:
         extent = [
             float(result.display_ranges_m[0]),
             float(result.display_ranges_m[-1]),
             float(result.times_s[-1]) if len(result.times_s) else 0.0,
             0.0,
         ]
-        ax1.imshow(result.heatmap_db, aspect="auto", extent=extent, cmap="viridis", vmin=speed.HEATMAP_DB_FLOOR, vmax=0)
-        ax1.plot(result.ranges_m, result.times_s, color="white", linewidth=0.9, alpha=0.75, label="跟踪距离")
-        ax1.plot(result.smoothed_ranges_m, result.times_s, color="#ffca28", linewidth=1.2, label="平滑轨迹")
-        ax1.set_title("距离-时间热图与目标轨迹")
-        ax1.set_xlabel("距离 (m)")
-        ax1.set_ylabel("时间 (s)")
-        ax1.legend(loc="best")
-        ax2.plot(result.times_s, result.speeds_mps, color="#1565c0", linewidth=1.2)
-        ax2.axhline(result.fitted_speed_mps, color="#b3261e", linestyle="--", linewidth=1.0, label="拟合速度")
-        ax2.set_title("速度估计")
-        ax2.set_xlabel("时间 (s)")
-        ax2.set_ylabel("速度 (m/s)")
-        ax2.grid(True, linestyle="--", alpha=0.35)
-        ax2.legend(loc="best")
-        figure.tight_layout()
+        ax.imshow(result.heatmap_db, aspect="auto", extent=extent, cmap="viridis", vmin=speed.HEATMAP_DB_FLOOR, vmax=0)
+        ax.plot(result.ranges_m, result.times_s, color="white", linewidth=0.9, alpha=0.75, label="跟踪距离")
+        ax.plot(result.smoothed_ranges_m, result.times_s, color="#ffca28", linewidth=1.2, label="平滑轨迹")
+        ax.set_title("距离-时间热图与目标轨迹")
+        ax.set_xlabel("距离 (m)")
+        ax.set_ylabel("时间 (s)")
+        ax.legend(loc="best")
+
+    @staticmethod
+    def _plot_speed_estimate(ax: matplotlib.axes.Axes, result: speed.SpeedAnalysisResult) -> None:
+        ax.plot(result.times_s, result.speeds_mps, color="#1565c0", linewidth=1.2)
+        ax.axhline(result.fitted_speed_mps, color="#b3261e", linestyle="--", linewidth=1.0, label="拟合速度")
+        ax.set_title("速度估计")
+        ax.set_xlabel("时间 (s)")
+        ax.set_ylabel("速度 (m/s)")
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="best")
 
     def _process_range_doppler(self) -> None:
         loaded = self._ensure_loaded()
@@ -733,6 +847,11 @@ class RadarApp:
     def _plot_range_doppler(self, figure: Figure, result: speed.RangeDopplerResult) -> None:
         figure.clear()
         ax = figure.add_subplot(111)
+        self._plot_range_doppler_map(figure, ax, result)
+        figure.tight_layout()
+
+    @staticmethod
+    def _plot_range_doppler_map(figure: Figure, ax: matplotlib.axes.Axes, result: speed.RangeDopplerResult) -> None:
         extent = [
             float(result.velocities_mps[0]),
             float(result.velocities_mps[-1]),
@@ -745,7 +864,6 @@ class RadarApp:
         ax.set_xlabel("速度 (m/s)")
         ax.set_ylabel("距离 (m)")
         figure.colorbar(image, ax=ax, label="相对功率 (dB)")
-        figure.tight_layout()
 
     def _analyze_current_angle(self, phase_correction: np.ndarray | None) -> tuple[angle.SingleTargetResult, angle.MultiTargetResult, np.ndarray]:
         loaded = self._ensure_loaded()
@@ -940,23 +1058,76 @@ class RadarApp:
         ax_map.set_ylabel("角度 (deg)")
         figure.colorbar(image, ax=ax_map, label="相对功率 (dB)")
         figure.tight_layout()
-        figure.canvas.mpl_connect("button_press_event", self._on_angle_popup)
 
-    def _on_angle_popup(self, event: matplotlib.backend_bases.MouseEvent) -> None:
-        """点击测角子图弹出独立放大窗口"""
-        if event.inaxes is None or self.current_result is None:
+    def _on_plot_popup(self, event: MouseEvent, module: str) -> None:
+        """点击结果子图后在独立窗口重画该图。"""
+        if event.inaxes is None or event.button != 1:
             return
-        if not isinstance(self.current_result, tuple) or len(self.current_result) < 2:
+        result = self.module_results.get(module)
+        if result is None:
             return
-        single, multi, _ = self.current_result
-        title = event.inaxes.get_title()
+        self._open_plot_popup(module, event.inaxes.get_title(), result)
 
+    def _open_plot_popup(self, module: str, title: str, result: object) -> None:
         popup = tk.Toplevel(self.root)
-        popup.title(f"测角 — {title}")
+        popup.title(f"{self._module_title(module)} — {title or '图像'}")
         popup.geometry("900x650")
         popup.minsize(500, 380)
 
         fig = Figure(figsize=(9, 5.8), dpi=100)
+        if not self._draw_popup_plot(fig, module, title, result):
+            popup.destroy()
+            return
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=popup)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(canvas, popup, pack_toolbar=True).update()
+
+    @staticmethod
+    def _module_title(module: str) -> str:
+        return {
+            "hrrp": "测距 / HRRP",
+            "precision": "测距精度",
+            "speed": "测速",
+            "range_doppler": "距离-多普勒",
+            "angle": "测角",
+        }.get(module, module)
+
+    def _draw_popup_plot(self, fig: Figure, module: str, title: str, result: object) -> bool:
+        if module == "hrrp" and isinstance(result, range_hrrp.HrrpAnalysis):
+            self._plot_hrrp(fig, result)
+            return True
+        if module == "precision" and isinstance(result, list):
+            precision_result = next(
+                (item for item in result if isinstance(item, range_precision.PrecisionResult) and title.startswith(item.case.label)),
+                None,
+            )
+            if precision_result is None:
+                return False
+            self._plot_precision_result(fig.add_subplot(111), precision_result)
+        return True
+        if module == "speed" and isinstance(result, speed.SpeedAnalysisResult):
+            ax = fig.add_subplot(111)
+            if title == "距离-时间热图与目标轨迹":
+                self._plot_speed_heatmap(ax, result)
+                return True
+            if title == "速度估计":
+                self._plot_speed_estimate(ax, result)
+                return True
+            return False
+        if module == "range_doppler" and isinstance(result, speed.RangeDopplerResult):
+            self._plot_range_doppler_map(fig, fig.add_subplot(111), result)
+            return True
+        if module == "angle":
+            return self._draw_angle_popup_plot(fig, title, result)
+        return False
+
+    def _draw_angle_popup_plot(self, fig: Figure, title: str, result: object) -> bool:
+        if not isinstance(result, tuple) or len(result) < 2:
+            return False
+        single, multi, _ = result
         ax = fig.add_subplot(111)
 
         if title == "时域信号":
@@ -1012,14 +1183,8 @@ class RadarApp:
             ax.set_ylabel("角度 (deg)")
             fig.colorbar(image, ax=ax, label="相对功率 (dB)")
         else:
-            popup.destroy()
-            return
-
-        fig.tight_layout()
-        canvas = FigureCanvasTkAgg(fig, master=popup)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(canvas, popup, pack_toolbar=True).update()
+            return False
+        return True
 
     def build_angle_calibration(self) -> None:
         if self.loaded is None:
@@ -1039,6 +1204,7 @@ class RadarApp:
         self.current_module = module
         self.current_result = result
         self.current_rows = rows
+        self.module_results[module] = result
         self.status_var.set(f"{self.tabs.tab(self.tabs.select(), 'text')} 处理完成")
 
     def save_current_result(self) -> None:
