@@ -778,15 +778,31 @@ class RadarApp:
             self.calibration.phase_correction if self.calibration else None
         )
         rows = [
-            ("单目标距离(m)", single.target_range_m),
+            ("角谱目标数", len(single.angle_targets)),
+            ("主目标距离(m)", single.target_range_m),
             ("相位差均值(deg)", single.mean_delta_deg),
             ("相位法角度(deg)", single.phase_angle_deg),
             ("FFT 角度(deg)", single.angle_fft_angle_deg),
             ("Capon 角度(deg)", single.capon_angle_deg),
             ("Capon 快拍数", single.capon_snapshot_count),
+            ("MUSIC 角度(deg)", single.music_angle_deg),
+            ("MUSIC 目标数", single.music_source_count),
+            ("MUSIC 快拍数", single.music_snapshot_count),
             ("检测目标数", len(multi.detections)),
             ("虚拟通道", ",".join(map(str, single.virtual_channels))),
         ]
+        for target in single.angle_targets:
+            peaks = ", ".join(f"{item:.2f}°" for item in target.music_peak_angles_deg) or "无"
+            rows.append((
+                f"角谱 T{target.serial}",
+                (
+                    f"R={target.target_range_m:.4f} m, "
+                    f"FFT={target.angle_fft_angle_deg:.3f}°, "
+                    f"Capon={target.capon_angle_deg:.3f}°, "
+                    f"MUSIC={target.music_angle_deg:.3f}°, "
+                    f"MUSIC峰={peaks}"
+                ),
+            ))
         for detection in multi.detections:
             rows.append((f"CFAR {detection.serial}", f"R={detection.range_m:.4f} m, angle={detection.angle_deg:.3f} deg, {detection.relative_power_db:.2f} dB"))
         pane = self.panes["angle"]
@@ -794,6 +810,79 @@ class RadarApp:
         self._plot_angle(pane.figure, single, multi)
         pane.canvas.draw_idle()
         self._set_current("angle", (single, multi, range_spectrum), rows)
+
+    @staticmethod
+    def _angle_target_color(index: int) -> str:
+        colors = ["#1565c0", "#ef6c00", "#2e7d32", "#6a1b9a", "#ad1457", "#00838f"]
+        return colors[index % len(colors)]
+
+    def _plot_angle_spectrum(self, ax: matplotlib.axes.Axes, single: angle.SingleTargetResult, popup: bool = False) -> None:
+        targets = single.angle_targets or []
+        for index, target in enumerate(targets):
+            color = self._angle_target_color(index)
+            prefix = f"T{target.serial}"
+            ax.plot(
+                single.angle_axis_deg,
+                target.angle_spectrum_db,
+                color=color,
+                linewidth=1.1,
+                linestyle="-",
+                label=f"{prefix} FFT {target.angle_fft_angle_deg:.1f}°",
+            )
+            if target.capon_spectrum_db.size:
+                ax.plot(
+                    single.angle_axis_deg,
+                    target.capon_spectrum_db,
+                    color=color,
+                    linewidth=1.0,
+                    linestyle="--",
+                    alpha=0.9,
+                    label=f"{prefix} Capon {target.capon_angle_deg:.1f}°",
+                )
+            if target.music_spectrum_db.size:
+                ax.plot(
+                    single.angle_axis_deg,
+                    target.music_spectrum_db,
+                    color=color,
+                    linewidth=1.0,
+                    linestyle=":",
+                    alpha=0.95,
+                    label=f"{prefix} MUSIC {target.music_angle_deg:.1f}°",
+                )
+            if np.isfinite(target.angle_fft_angle_deg):
+                ax.axvline(target.angle_fft_angle_deg, color=color, linestyle="-", linewidth=0.8, alpha=0.25)
+            if np.isfinite(target.capon_angle_deg):
+                ax.axvline(target.capon_angle_deg, color=color, linestyle="--", linewidth=0.8, alpha=0.25)
+            for peak_angle in target.music_peak_angles_deg:
+                ax.axvline(peak_angle, color=color, linestyle=":", linewidth=0.8, alpha=0.35)
+
+        ax.set_title("角谱")
+        ax.set_xlabel("角度 (deg)")
+        ax.set_ylabel("相对功率 (dB)")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        if targets:
+            ax.legend(loc="lower left", fontsize=8 if popup else 7, ncol=2 if len(targets) > 1 else 1)
+        if len(targets) == 1:
+            target = targets[0]
+            ax.text(0.97, 0.95, f"FFT θ={target.angle_fft_angle_deg:.3f}°",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=11 if popup else 10, color="#b3261e",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
+            if np.isfinite(target.phase_angle_deg):
+                ax.text(0.97, 0.85, f"相位法θ={target.phase_angle_deg:.3f}°",
+                        transform=ax.transAxes, ha="right", va="top",
+                        fontsize=10 if popup else 9, color="#1565c0",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
+            if np.isfinite(target.capon_angle_deg):
+                ax.text(0.97, 0.75, f"Capon θ={target.capon_angle_deg:.3f}°",
+                        transform=ax.transAxes, ha="right", va="top",
+                        fontsize=10 if popup else 9, color="#2e7d32",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2e7d32", lw=0.8, alpha=0.9))
+            if np.isfinite(target.music_angle_deg):
+                ax.text(0.97, 0.65, f"MUSIC θ={target.music_angle_deg:.3f}°",
+                        transform=ax.transAxes, ha="right", va="top",
+                        fontsize=10 if popup else 9, color="#6a1b9a",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#6a1b9a", lw=0.8, alpha=0.9))
 
     def _plot_angle(self, figure: Figure, single: angle.SingleTargetResult, multi: angle.MultiTargetResult) -> None:
         figure.clear()
@@ -807,7 +896,19 @@ class RadarApp:
         ax_time.grid(True, linestyle="--", alpha=0.3)
 
         ax_hrrp.plot(single.ranges_m, single.hrrp_db, color="#1565c0", linewidth=1.1)
-        ax_hrrp.axvline(single.target_range_m, color="#b3261e", linestyle="--", linewidth=1.0)
+        for index, target in enumerate(single.angle_targets):
+            color = self._angle_target_color(index)
+            ax_hrrp.axvline(target.target_range_m, color=color, linestyle="--", linewidth=0.9)
+            ax_hrrp.text(
+                target.target_range_m,
+                2.8 - index * 4.0,
+                f"T{target.serial}",
+                ha="center",
+                va="top",
+                fontsize=8,
+                color=color,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, lw=0.7, alpha=0.85),
+            )
         ax_hrrp.set_xlim(0, single.max_display_range_m)
         ax_hrrp.set_ylim(angle.HRRP_DB_FLOOR, 4)
         ax_hrrp.set_title("测角 HRRP")
@@ -818,32 +919,7 @@ class RadarApp:
                      fontsize=10, color="#b3261e",
                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
 
-        ax_angle.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1, label="FFT")
-        if single.capon_spectrum_db.size:
-            ax_angle.plot(single.angle_axis_deg, single.capon_spectrum_db, color="#2e7d32", linewidth=1.1, label="Capon")
-        ax_angle.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
-        if np.isfinite(single.capon_angle_deg):
-            ax_angle.axvline(single.capon_angle_deg, color="#2e7d32", linestyle=":", linewidth=1.0)
-        ax_angle.set_title("角谱")
-        ax_angle.set_xlabel("角度 (deg)")
-        ax_angle.set_ylabel("相对功率 (dB)")
-        ax_angle.grid(True, linestyle="--", alpha=0.3)
-        ax_angle.legend(loc="lower left", fontsize=8)
-        ax_angle.text(0.97, 0.95, f"θ={single.angle_fft_angle_deg:.3f}°",
-                      transform=ax_angle.transAxes, ha="right", va="top",
-                      fontsize=10, color="#b3261e",
-                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
-        phase_angle_display = f"相位法θ={single.phase_angle_deg:.3f}°" if np.isfinite(single.phase_angle_deg) else ""
-        if phase_angle_display:
-            ax_angle.text(0.97, 0.86, phase_angle_display,
-                          transform=ax_angle.transAxes, ha="right", va="top",
-                          fontsize=9, color="#1565c0",
-                          bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
-        if np.isfinite(single.capon_angle_deg):
-            ax_angle.text(0.97, 0.77, f"Caponθ={single.capon_angle_deg:.3f}°",
-                          transform=ax_angle.transAxes, ha="right", va="top",
-                          fontsize=9, color="#2e7d32",
-                          bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2e7d32", lw=0.8, alpha=0.9))
+        self._plot_angle_spectrum(ax_angle, single)
 
         extent = [
             float(multi.ranges_m[0]),
@@ -892,7 +968,19 @@ class RadarApp:
             ax.grid(True, linestyle="--", alpha=0.3)
         elif title == "测角 HRRP":
             ax.plot(single.ranges_m, single.hrrp_db, color="#1565c0", linewidth=1.1)
-            ax.axvline(single.target_range_m, color="#b3261e", linestyle="--", linewidth=1.0)
+            for index, target in enumerate(single.angle_targets):
+                color = self._angle_target_color(index)
+                ax.axvline(target.target_range_m, color=color, linestyle="--", linewidth=0.9)
+                ax.text(
+                    target.target_range_m,
+                    2.8 - index * 4.0,
+                    f"T{target.serial}",
+                    ha="center",
+                    va="top",
+                    fontsize=9,
+                    color=color,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, lw=0.7, alpha=0.85),
+                )
             ax.set_xlim(0, single.max_display_range_m)
             ax.set_ylim(angle.HRRP_DB_FLOOR, 4)
             ax.set_title("测角 HRRP")
@@ -903,31 +991,7 @@ class RadarApp:
                     fontsize=11, color="#b3261e",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
         elif title == "角谱":
-            ax.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1, label="FFT")
-            if single.capon_spectrum_db.size:
-                ax.plot(single.angle_axis_deg, single.capon_spectrum_db, color="#2e7d32", linewidth=1.1, label="Capon")
-            ax.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
-            if np.isfinite(single.capon_angle_deg):
-                ax.axvline(single.capon_angle_deg, color="#2e7d32", linestyle=":", linewidth=1.0)
-            ax.set_title("角谱")
-            ax.set_xlabel("角度 (deg)")
-            ax.set_ylabel("相对功率 (dB)")
-            ax.grid(True, linestyle="--", alpha=0.3)
-            ax.legend(loc="lower left", fontsize=9)
-            ax.text(0.97, 0.95, f"FFT θ={single.angle_fft_angle_deg:.3f}°",
-                    transform=ax.transAxes, ha="right", va="top",
-                    fontsize=11, color="#b3261e",
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
-            if np.isfinite(single.phase_angle_deg):
-                ax.text(0.97, 0.85, f"相位法θ={single.phase_angle_deg:.3f}°",
-                        transform=ax.transAxes, ha="right", va="top",
-                        fontsize=10, color="#1565c0",
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
-            if np.isfinite(single.capon_angle_deg):
-                ax.text(0.97, 0.75, f"Capon θ={single.capon_angle_deg:.3f}°",
-                        transform=ax.transAxes, ha="right", va="top",
-                        fontsize=10, color="#2e7d32",
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2e7d32", lw=0.8, alpha=0.9))
+            self._plot_angle_spectrum(ax, single, popup=True)
         elif title == "距离-角度图":
             extent = [
                 float(multi.ranges_m[0]), float(multi.ranges_m[-1]),
@@ -1060,6 +1124,23 @@ class RadarApp:
                 writer.writerow(["single_phase", single.target_range_m, single.phase_angle_deg, single.mean_delta_deg])
                 writer.writerow(["single_fft", single.target_range_m, single.angle_fft_angle_deg, ""])
                 writer.writerow(["single_capon", single.target_range_m, single.capon_angle_deg, single.capon_snapshot_count])
+                writer.writerow([
+                    "single_music",
+                    single.target_range_m,
+                    single.music_angle_deg,
+                    f"sources={single.music_source_count}, snapshots={single.music_snapshot_count}",
+                ])
+                for target in single.angle_targets:
+                    music_peaks = ";".join(f"{item:.6g}" for item in target.music_peak_angles_deg)
+                    writer.writerow([f"target_{target.serial}_phase", target.target_range_m, target.phase_angle_deg, target.mean_delta_deg])
+                    writer.writerow([f"target_{target.serial}_fft", target.target_range_m, target.angle_fft_angle_deg, target.relative_power_db])
+                    writer.writerow([f"target_{target.serial}_capon", target.target_range_m, target.capon_angle_deg, target.capon_snapshot_count])
+                    writer.writerow([
+                        f"target_{target.serial}_music",
+                        target.target_range_m,
+                        target.music_angle_deg,
+                        f"sources={target.music_source_count}, snapshots={target.music_snapshot_count}, peaks={music_peaks}",
+                    ])
                 for detection in multi.detections:
                     writer.writerow(["cfar", detection.range_m, detection.angle_deg, detection.relative_power_db])
             else:
