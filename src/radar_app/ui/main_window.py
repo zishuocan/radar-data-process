@@ -22,7 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 from radar_app.core import FORMAT_OPTIONS, WINDOW_OPTIONS, LoadedRadarData, RadarParams, load_radar_data
-from radar_app.modules import angle, range_hrrp, range_precision, speed
+from radar_app.modules import angle, range_hrrp, range_precision, replay, speed
 
 
 class ToolTip:
@@ -216,6 +216,15 @@ class RadarApp:
         self.angle_guard_angle_var = tk.StringVar(value="2")
         self.angle_threshold_var = tk.StringVar(value="0.0")
 
+        # 数据回放
+        self.replay_antenna_var = tk.StringVar(value="1")
+        self.replay_chirp_var = tk.StringVar(value="平均")
+        self.replay_speed_var = tk.StringVar(value="2")
+        self.replay_frame = 0
+        self.replay_playing = False
+        self.replay_data: replay.ReplayData | None = None
+        self.replay_anim_id: str | None = None
+
         self._build_ui()
         self._draw_empty()
 
@@ -314,6 +323,7 @@ class RadarApp:
         self._add_speed_tab()
         self._add_range_doppler_tab()
         self._add_angle_tab()
+        self._add_replay_tab()
 
     def _make_tab(self, key: str, title: str) -> tuple[ttk.Frame, ttk.Frame, ResultPane]:
         tab = ttk.Frame(self.tabs, padding=8)
@@ -438,6 +448,172 @@ class RadarApp:
         self._field(controls, 2, 4, "阈值(dB)", self.angle_threshold_var,
                     tip="CFAR 检测门限（dB）\n越低检测灵敏度越高，虚警也越多\n0 表示自适应门限")
 
+    # ---- 数据回放标签页 ----
+
+    def _add_replay_tab(self) -> None:
+        _tab, controls, pane = self._make_tab("replay", "数据回放")
+
+        self._field(controls, 0, 0, "天线", self.replay_antenna_var, width=10,
+                    tip="选择要回放的天线通道\n读取文件后可用")
+        ttk.Label(controls, text="Chirp").grid(row=0, column=2, sticky=tk.W, padx=6, pady=4)
+        _c = ttk.Combobox(controls, textvariable=self.replay_chirp_var,
+                          values=["平均", "1", "2", "3", "4", "5", "6", "7", "8"],
+                          state="readonly", width=10)
+        _c.grid(row=0, column=3, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_c, "选择要回放的 Chirp\n“平均”为所有 Chirp 平均")
+
+        ttk.Label(controls, text="速度").grid(row=0, column=4, sticky=tk.W, padx=6, pady=4)
+        _s = ttk.Combobox(controls, textvariable=self.replay_speed_var,
+                          values=["0.5", "1", "2", "4", "8"], state="readonly", width=8)
+        _s.grid(row=0, column=5, sticky=tk.EW, padx=6, pady=4)
+        ToolTip(_s, "播放速度倍率\n1 = 实时（帧周期 × 1）")
+
+        # 回放按钮
+        self.replay_play_btn = ttk.Button(controls, text="▶ 播放", command=self._toggle_replay)
+        self.replay_play_btn.grid(row=0, column=6, padx=6, pady=4)
+        ToolTip(self.replay_play_btn, "开始/暂停回放")
+
+        self.replay_reset_btn = ttk.Button(controls, text="⏮ 重置", command=self._reset_replay)
+        self.replay_reset_btn.grid(row=0, column=7, padx=6, pady=4)
+        ToolTip(self.replay_reset_btn, "重置到第一帧")
+
+        # 帧滑块
+        ttk.Label(controls, text="帧").grid(row=0, column=8, sticky=tk.W, padx=6, pady=4)
+        self.replay_slider = ttk.Scale(controls, from_=1, to=2, orient=tk.HORIZONTAL,
+                                        value=1, command=self._on_replay_slide)
+        self.replay_slider.grid(row=0, column=9, sticky=tk.EW, padx=6, pady=4)
+        controls.columnconfigure(9, weight=1)
+        self.replay_frame_label = ttk.Label(controls, text="帧 1/1", width=8)
+        self.replay_frame_label.grid(row=0, column=10, padx=6, pady=4)
+
+        # 处理按钮
+        _b = ttk.Button(controls, text="生成回放数据", command=self._process_replay)
+        _b.grid(row=0, column=11, padx=6, pady=4)
+        ToolTip(_b, "对所有帧计算距离像，生成瀑布图数据")
+
+    def _process_replay(self) -> None:
+        """生成回放数据"""
+        if self.loaded is None:
+            self.load_file()
+        if self.loaded is None:
+            messagebox.showerror("回放", "请先读取 bin 文件")
+            return
+
+        params = self._params()
+        ant = self.replay_antenna_var.get()
+        chirp = self.replay_chirp_var.get()
+
+        try:
+            self.replay_data = replay.compute_replay_data(
+                self.loaded.data, params,
+                antenna_choice=ant,
+                chirp_choice=chirp,
+                window_name=self.window_var.get(),
+                zero_padding_power=int(float(self.zero_padding_var.get())),
+            )
+        except Exception as exc:
+            messagebox.showerror("回放失败", str(exc))
+            return
+
+        n_frames = len(self.replay_data.times_s)
+        self.replay_slider.configure(to=max(2, n_frames))
+        self.replay_frame = 0
+        self.replay_playing = False
+        self.replay_play_btn.configure(text="▶ 播放")
+
+        # 绘制初始瀑布图
+        self._plot_replay()
+        pane = self.panes["replay"]
+        pane.canvas.draw_idle()
+        self.status_var.set(f"回放数据已生成: {n_frames} 帧")
+
+    def _plot_replay(self) -> None:
+        """绘制瀑布图 + 当前帧高亮线"""
+        rd = self.replay_data
+        if rd is None:
+            return
+        pane = self.panes["replay"]
+        pane.figure.clear()
+        ax1 = pane.figure.add_subplot(211)
+        ax2 = pane.figure.add_subplot(212, sharex=ax1)
+
+        # 瀑布图
+        extent = [float(rd.ranges_m[0]), float(rd.ranges_m[-1]),
+                  float(rd.times_s[-1]), float(rd.times_s[0])]
+        ax1.imshow(rd.waterfall_db, aspect="auto", extent=extent,
+                   cmap="viridis", vmin=-60, vmax=0)
+        # 当前帧高亮线
+        current_time = rd.times_s[self.replay_frame]
+        ax1.axhline(current_time, color="white", linewidth=1.2, linestyle="-")
+        ax1.set_ylabel("时间 (s)")
+        ax1.set_title("距离像瀑布图")
+
+        # 当前帧距离像
+        ax2.plot(rd.ranges_m, rd.waterfall_db[self.replay_frame],
+                 color="#1565c0", linewidth=1.2)
+        ax2.axvline(rd.ranges_m[int(np.argmax(rd.waterfall_db[self.replay_frame]))],
+                    color="#b3261e", linestyle="--", linewidth=1.0)
+        ax2.set_xlabel("距离 (m)")
+        ax2.set_ylabel("幅度 (dB)")
+        ax2.set_ylim(-60, 4)
+        ax2.grid(True, linestyle="--", alpha=0.3)
+        ax2.set_title(f"帧 {self.replay_frame + 1}/{len(rd.times_s)}")
+
+        pane.figure.tight_layout()
+        self.replay_frame_label.configure(text=f"帧 {self.replay_frame + 1}/{len(rd.times_s)}")
+
+    def _toggle_replay(self) -> None:
+        if self.replay_data is None:
+            self._process_replay()
+            return
+        self.replay_playing = not self.replay_playing
+        self.replay_play_btn.configure(text="⏸ 暂停" if self.replay_playing else "▶ 播放")
+        if self.replay_playing:
+            self._animate_replay()
+
+    def _animate_replay(self) -> None:
+        if not self.replay_playing or self.replay_data is None:
+            return
+        rd = self.replay_data
+        # 前进一帧
+        self.replay_frame += 1
+        if self.replay_frame >= len(rd.times_s):
+            self.replay_frame = 0  # 循环播放
+        # 更新滑块
+        self.replay_slider.set(self.replay_frame + 1)
+        # 重绘
+        self._plot_replay()
+        pane = self.panes["replay"]
+        pane.canvas.draw_idle()
+        # 调度下一帧
+        speed = float(self.replay_speed_var.get())
+        delay_ms = int(max(20, rd.times_s[1] - rd.times_s[0]) * 1000 / speed) if len(rd.times_s) > 1 else 200
+        self.replay_anim_id = self.root.after(delay_ms, self._animate_replay)
+
+    def _on_replay_slide(self, value: str) -> None:
+        if self.replay_data is None:
+            return
+        self.replay_frame = max(0, min(len(self.replay_data.times_s) - 1, int(float(value)) - 1))
+        self._plot_replay()
+        pane = self.panes["replay"]
+        pane.canvas.draw_idle()
+
+    def _reset_replay(self) -> None:
+        self.replay_playing = False
+        self.replay_play_btn.configure(text="▶ 播放")
+        if self.replay_anim_id:
+            try:
+                self.root.after_cancel(self.replay_anim_id)
+            except Exception:
+                pass
+            self.replay_anim_id = None
+        if self.replay_data is not None:
+            self.replay_frame = 0
+            self.replay_slider.set(1)
+            self._plot_replay()
+            pane = self.panes["replay"]
+            pane.canvas.draw_idle()
+
     def _draw_empty(self) -> None:
         for pane in self.panes.values():
             pane.figure.clear()
@@ -523,6 +699,8 @@ class RadarApp:
                 self._process_range_doppler()
             elif key == "angle":
                 self._process_angle()
+            elif key == "replay":
+                self._process_replay()
         except Exception as exc:
             messagebox.showerror("处理失败", str(exc))
             self.status_var.set(f"处理失败: {exc}")
