@@ -6,6 +6,7 @@ dependencies:
   - python>=3.10
   - numpy
   - matplotlib
+  - scipy
   - tk          # tkinter GUI toolkit (bundled with Python on most platforms)
   - pip
   - pip:
