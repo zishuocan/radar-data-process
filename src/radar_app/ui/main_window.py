@@ -192,7 +192,6 @@ class RadarApp:
         self.speed_smooth_var = tk.StringVar(value="3")
         self.speed_suppress_var = tk.BooleanVar(value=True)
         self.speed_prefer_approach_var = tk.BooleanVar(value=False)
-        self.speed_track_method_var = tk.StringVar(value="viterbi")
 
         self.rd_frame_var = tk.StringVar(value="1")
         self.rd_min_range_var = tk.StringVar(value="0.1")
@@ -387,11 +386,6 @@ class RadarApp:
         _ck = ttk.Checkbutton(controls, text="优先接近目标", variable=self.speed_prefer_approach_var)
         _ck.grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=6)
         ToolTip(_ck, "启用后在轨迹跟踪中偏向距离减小的方向\n适合追踪正在靠近的目标")
-        ttk.Label(controls, text="跟踪方法").grid(row=1, column=4, sticky=tk.W, padx=6, pady=4)
-        _m = ttk.Combobox(controls, textvariable=self.speed_track_method_var,
-                          values=["viterbi", "kalman"], state="readonly", width=10)
-        _m.grid(row=1, column=5, sticky=tk.EW, padx=6, pady=4)
-        ToolTip(_m, "目标跟踪算法\n• viterbi: 动态规划（默认）\n• kalman: 卡尔曼滤波（更平滑，可处理短暂遮挡")
 
     def _add_range_doppler_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("range_doppler", "距离-多普勒")
@@ -658,10 +652,8 @@ class RadarApp:
             min_margin_db=float(self.speed_margin_var.get()),
             prefer_approaching=self.speed_prefer_approach_var.get(),
             smooth_frames=int(float(self.speed_smooth_var.get())),
-            track_method=self.speed_track_method_var.get(),
         )
         rows = [
-            ("跟踪方法", self.speed_track_method_var.get()),
             ("有效帧数", f"{result.valid_frame_count} / {len(result.times_s)}"),
             ("起始距离(m)", result.start_range_m),
             ("结束距离(m)", result.end_range_m),

@@ -272,116 +272,6 @@ def robust_speed_summary(
     )
 
 
-def kalman_track_target_range(
-    ranges_m: np.ndarray,
-    power: np.ndarray,
-    times_s: np.ndarray,
-    min_range_m: float,
-    max_range_m: float,
-    max_jump_m: float,
-    min_margin_db: float,
-    q_range: float = 0.5,
-    q_velocity: float = 0.1,
-    r_range: float = 0.01,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """卡尔曼滤波目标跟踪
-
-    状态: [range, velocity]^T
-    观测: range（距离FFT峰值）
-
-    Args:
-        ranges_m: 距离轴
-        power: (n_frames, n_ranges) 距离功率
-        times_s: 每帧时间戳
-        搜索范围/阈值参数同 track_target_range
-        q_range/q_velocity: 过程噪声（越大越机动）
-        r_range: 观测噪声（越大越信任预测）
-
-    Returns:
-        (track_indices, confidence_db, valid_mask) 同 track_target_range
-    """
-    valid_indices = np.where((ranges_m >= min_range_m) & (ranges_m <= max_range_m))[0]
-    if valid_indices.size == 0:
-        raise ValueError("搜索距离范围内没有可用距离单元")
-
-    n_frames = power.shape[0]
-    dt = times_s[1] - times_s[0] if n_frames > 1 else 0.1
-
-    # 状态转移矩阵 F = [[1, dt], [0, 1]]
-    # 观测矩阵 H = [[1, 0]]
-    # 过程噪声协方差 Q
-    # 观测噪声协方差 R
-    F = np.array([[1.0, dt], [0.0, 1.0]], dtype=np.float64)
-    H = np.array([[1.0, 0.0]], dtype=np.float64)
-    Q = np.array([[q_range, 0.0], [0.0, q_velocity]], dtype=np.float64)
-    R = np.array([[r_range]], dtype=np.float64)
-
-    track_indices = np.zeros(n_frames, dtype=int)
-    confidence_db = np.zeros(n_frames, dtype=np.float64)
-    valid_mask = np.zeros(n_frames, dtype=bool)
-
-    # 初始状态: 用第一帧的最强峰
-    first_valid = valid_indices[np.argmax(power[0, valid_indices])]
-    x = np.array([float(ranges_m[first_valid]), 0.0], dtype=np.float64)
-    P = np.eye(2, dtype=np.float64) * 0.1
-    track_indices[0] = first_valid
-    noise_floor_db = np.median(10.0 * np.log10(np.maximum(power[0, valid_indices], EPS)))
-    peak_db = 10.0 * np.log10(max(power[0, first_valid], EPS))
-    confidence_db[0] = peak_db - noise_floor_db
-    valid_mask[0] = confidence_db[0] >= min_margin_db
-
-    # 逐帧跟踪
-    for frame_idx in range(1, n_frames):
-        # --- 预测 ---
-        x_pred = F @ x
-        P_pred = F @ P @ F.T + Q
-        predicted_range = x_pred[0]
-
-        # --- 在预测位置附近搜索最佳候选 ---
-        search_window = max_jump_m * 2.0
-        candidate_indices = valid_indices[
-            np.abs(ranges_m[valid_indices] - predicted_range) <= search_window
-        ]
-
-        if candidate_indices.size > 0:
-            # 找功率最大的候选
-            best_local = candidate_indices[np.argmax(power[frame_idx, candidate_indices])]
-            z = float(ranges_m[best_local])
-
-            # 计算该候选的信噪比
-            nf_db = np.median(10.0 * np.log10(np.maximum(power[frame_idx, valid_indices], EPS)))
-            p_db = 10.0 * np.log10(max(power[frame_idx, best_local], EPS))
-            conf = p_db - nf_db
-
-            if conf >= min_margin_db:
-                # --- 更新（有效观测） ---
-                y = z - H @ x_pred  # 创新
-                S = H @ P_pred @ H.T + R
-                K = P_pred @ H.T @ np.linalg.inv(S)
-                x = x_pred + (K @ y).flatten()
-                P = (np.eye(2) - K @ H) @ P_pred
-                track_indices[frame_idx] = best_local
-                confidence_db[frame_idx] = conf
-                valid_mask[frame_idx] = True
-            else:
-                # 观测 SNR 不足 → 用预测值（coast）
-                x = x_pred
-                P = P_pred
-                # 找最近的索引
-                track_indices[frame_idx] = valid_indices[np.argmin(np.abs(ranges_m[valid_indices] - predicted_range))]
-                confidence_db[frame_idx] = conf
-                valid_mask[frame_idx] = False
-        else:
-            # 搜索窗口内无候选 → 用预测值
-            x = x_pred
-            P = P_pred
-            track_indices[frame_idx] = valid_indices[np.argmin(np.abs(ranges_m[valid_indices] - predicted_range))]
-            confidence_db[frame_idx] = -999.0
-            valid_mask[frame_idx] = False
-
-    return track_indices, confidence_db, valid_mask
-
-
 def analyze_speed(
     data: np.ndarray,
     params: RadarParams,
@@ -396,7 +286,6 @@ def analyze_speed(
     min_margin_db: float,
     prefer_approaching: bool,
     smooth_frames: int,
-    track_method: str = "viterbi",
 ) -> SpeedAnalysisResult:
     ranges_m, power, nfft = compute_range_power(
         data,
@@ -429,12 +318,6 @@ def analyze_speed(
 
     frame_count = power.shape[0]
     times_s = np.arange(frame_count, dtype=np.float64) * (params.frame_period_ms / 1000.0)
-
-    if track_method == "kalman":
-        track_indices, confidence_db, valid_mask = kalman_track_target_range(
-            ranges_m, power, times_s,
-            min_range_m, max_range_m, max_jump_m, min_margin_db,
-        )
     tracked_ranges = ranges_m[track_indices]
     filled_ranges = fill_invalid_ranges(tracked_ranges, times_s, valid_mask)
     smoothed_ranges = moving_average(filled_ranges, smooth_frames)
