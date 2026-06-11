@@ -678,6 +678,10 @@ class RadarApp:
         ax_hrrp.set_title("测角 HRRP")
         ax_hrrp.set_xlabel("距离 (m)")
         ax_hrrp.grid(True, linestyle="--", alpha=0.3)
+        ax_hrrp.text(0.97, 0.95, f"R={single.target_range_m:.4f} m",
+                     transform=ax_hrrp.transAxes, ha="right", va="top",
+                     fontsize=10, color="#b3261e",
+                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
 
         ax_angle.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1)
         ax_angle.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
@@ -685,6 +689,16 @@ class RadarApp:
         ax_angle.set_xlabel("角度 (deg)")
         ax_angle.set_ylabel("相对功率 (dB)")
         ax_angle.grid(True, linestyle="--", alpha=0.3)
+        ax_angle.text(0.97, 0.95, f"θ={single.angle_fft_angle_deg:.3f}°",
+                      transform=ax_angle.transAxes, ha="right", va="top",
+                      fontsize=10, color="#b3261e",
+                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
+        phase_angle_display = f"相位法θ={single.phase_angle_deg:.3f}°" if np.isfinite(single.phase_angle_deg) else ""
+        if phase_angle_display:
+            ax_angle.text(0.97, 0.86, phase_angle_display,
+                          transform=ax_angle.transAxes, ha="right", va="top",
+                          fontsize=9, color="#1565c0",
+                          bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
 
         extent = [
             float(multi.ranges_m[0]),
@@ -695,6 +709,11 @@ class RadarApp:
         image = ax_map.imshow(multi.range_angle_db, aspect="auto", origin="lower", extent=extent, cmap="turbo", vmin=angle.RANGE_ANGLE_DB_FLOOR, vmax=0)
         for detection in multi.detections:
             ax_map.plot(detection.range_m, detection.angle_deg, "x", color="white", markersize=7)
+            ax_map.annotate(f"R={detection.range_m:.3f}m\nθ={detection.angle_deg:.2f}°",
+                            (detection.range_m, detection.angle_deg),
+                            textcoords="offset points", xytext=(8, 8),
+                            fontsize=8, color="white",
+                            bbox=dict(boxstyle="round,pad=0.2", fc="#333", ec="white", lw=0.6, alpha=0.8))
         ax_map.set_title("距离-角度图")
         ax_map.set_xlabel("距离 (m)")
         ax_map.set_ylabel("角度 (deg)")
@@ -734,6 +753,10 @@ class RadarApp:
             ax.set_title("测角 HRRP")
             ax.set_xlabel("距离 (m)")
             ax.grid(True, linestyle="--", alpha=0.3)
+            ax.text(0.97, 0.95, f"R={single.target_range_m:.4f} m",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=11, color="#b3261e",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
         elif title == "角谱":
             ax.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1)
             ax.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
@@ -741,6 +764,15 @@ class RadarApp:
             ax.set_xlabel("角度 (deg)")
             ax.set_ylabel("相对功率 (dB)")
             ax.grid(True, linestyle="--", alpha=0.3)
+            ax.text(0.97, 0.95, f"FFT θ={single.angle_fft_angle_deg:.3f}°",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=11, color="#b3261e",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#b3261e", lw=0.8, alpha=0.9))
+            if np.isfinite(single.phase_angle_deg):
+                ax.text(0.97, 0.85, f"相位法θ={single.phase_angle_deg:.3f}°",
+                        transform=ax.transAxes, ha="right", va="top",
+                        fontsize=10, color="#1565c0",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1565c0", lw=0.8, alpha=0.9))
         elif title == "距离-角度图":
             extent = [
                 float(multi.ranges_m[0]), float(multi.ranges_m[-1]),
@@ -751,6 +783,11 @@ class RadarApp:
                               vmin=angle.RANGE_ANGLE_DB_FLOOR, vmax=0)
             for detection in multi.detections:
                 ax.plot(detection.range_m, detection.angle_deg, "x", color="white", markersize=7)
+                ax.annotate(f"R={detection.range_m:.3f}m\nθ={detection.angle_deg:.2f}°",
+                            (detection.range_m, detection.angle_deg),
+                            textcoords="offset points", xytext=(8, 8),
+                            fontsize=9, color="white",
+                            bbox=dict(boxstyle="round,pad=0.2", fc="#333", ec="white", lw=0.6, alpha=0.8))
             ax.set_title("距离-角度图")
             ax.set_xlabel("距离 (m)")
             ax.set_ylabel("角度 (deg)")
