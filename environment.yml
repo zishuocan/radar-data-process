@@ -1,0 +1,12 @@
+name: radar-app
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy
+  - matplotlib
+  - tk          # tkinter GUI toolkit (bundled with Python on most platforms)
+  - pip
+  - pip:
+      - -e .    # install the local radar-app package in editable mode
