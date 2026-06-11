@@ -17,6 +17,7 @@ matplotlib.rcParams["font.sans-serif"] = [
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 import numpy as np
+from matplotlib.backend_bases import MouseEvent
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
@@ -699,6 +700,70 @@ class RadarApp:
         ax_map.set_ylabel("角度 (deg)")
         figure.colorbar(image, ax=ax_map, label="相对功率 (dB)")
         figure.tight_layout()
+        figure.canvas.mpl_connect("button_press_event", self._on_angle_popup)
+
+    def _on_angle_popup(self, event: matplotlib.backend_bases.MouseEvent) -> None:
+        """点击测角子图弹出独立放大窗口"""
+        if event.inaxes is None or self.current_result is None:
+            return
+        if not isinstance(self.current_result, tuple) or len(self.current_result) < 2:
+            return
+        single, multi, _ = self.current_result
+        title = event.inaxes.get_title()
+
+        popup = tk.Toplevel(self.root)
+        popup.title(f"测角 — {title}")
+        popup.geometry("900x650")
+        popup.minsize(500, 380)
+
+        fig = Figure(figsize=(9, 5.8), dpi=100)
+        ax = fig.add_subplot(111)
+
+        if title == "时域信号":
+            ax.plot(single.time_us, np.real(single.time_signal), color="#1565c0", linewidth=1.0)
+            if np.iscomplexobj(single.time_signal):
+                ax.plot(single.time_us, np.imag(single.time_signal), color="#ef6c00", linewidth=1.0, alpha=0.8)
+            ax.set_title("时域信号")
+            ax.set_xlabel("时间 (us)")
+            ax.grid(True, linestyle="--", alpha=0.3)
+        elif title == "测角 HRRP":
+            ax.plot(single.ranges_m, single.hrrp_db, color="#1565c0", linewidth=1.1)
+            ax.axvline(single.target_range_m, color="#b3261e", linestyle="--", linewidth=1.0)
+            ax.set_xlim(0, single.max_display_range_m)
+            ax.set_ylim(angle.HRRP_DB_FLOOR, 4)
+            ax.set_title("测角 HRRP")
+            ax.set_xlabel("距离 (m)")
+            ax.grid(True, linestyle="--", alpha=0.3)
+        elif title == "角谱":
+            ax.plot(single.angle_axis_deg, single.angle_spectrum_db, color="#1565c0", linewidth=1.1)
+            ax.axvline(single.angle_fft_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
+            ax.set_title("角谱")
+            ax.set_xlabel("角度 (deg)")
+            ax.set_ylabel("相对功率 (dB)")
+            ax.grid(True, linestyle="--", alpha=0.3)
+        elif title == "距离-角度图":
+            extent = [
+                float(multi.ranges_m[0]), float(multi.ranges_m[-1]),
+                float(multi.angle_axis_deg[0]), float(multi.angle_axis_deg[-1]),
+            ]
+            image = ax.imshow(multi.range_angle_db, aspect="auto", origin="lower",
+                              extent=extent, cmap="turbo",
+                              vmin=angle.RANGE_ANGLE_DB_FLOOR, vmax=0)
+            for detection in multi.detections:
+                ax.plot(detection.range_m, detection.angle_deg, "x", color="white", markersize=7)
+            ax.set_title("距离-角度图")
+            ax.set_xlabel("距离 (m)")
+            ax.set_ylabel("角度 (deg)")
+            fig.colorbar(image, ax=ax, label="相对功率 (dB)")
+        else:
+            popup.destroy()
+            return
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=popup)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(canvas, popup, pack_toolbar=True).update()
 
     def build_angle_calibration(self) -> None:
         if self.current_module != "angle" or not isinstance(self.current_result, tuple):

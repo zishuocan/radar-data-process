@@ -20,7 +20,7 @@ conda activate radar-app
 ### 方法二：pip（在已有 Python ≥ 3.10 环境中）
 
 ```bash
-pip install -r requirements.txt
+pip install numpy matplotlib
 pip install -e .
 ```
 
@@ -31,5 +31,6 @@ pip install -e .
 ## 运行
 
 ```powershell
+$env:PYTHONPATH = "src"
 python -m radar_app
 ```
