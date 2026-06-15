@@ -178,9 +178,11 @@ class RadarApp:
         self.chirp_var = tk.StringVar(value="1")
 
         self.hrrp_keep_var = tk.StringVar(value="1.0")
-        self.hrrp_target_count_var = tk.StringVar(value="2")
+        self.hrrp_target_count_var = tk.StringVar(value="1")
         self.hrrp_min_range_var = tk.StringVar(value="0.15")
         self.hrrp_min_gap_var = tk.StringVar(value="0.15")
+        self.hrrp_music_enabled_var = tk.BooleanVar(value=False)
+        self.hrrp_music_source_var = tk.StringVar(value="1")
 
         self.precision_min_range_var = tk.StringVar(value="0.15")
         self.precision_noise_max_var = tk.StringVar(value="")
@@ -355,6 +357,11 @@ class RadarApp:
                     tip="忽略该距离以内的峰值\n用于消除近场强杂波的干扰")
         self._field(controls, 0, 6, "目标间隔(m)", self.hrrp_min_gap_var,
                     tip="两个不同目标之间的最小距离间隔\n小于此间隔的峰值视为同一目标")
+        _c = ttk.Checkbutton(controls, text="MUSIC增强", variable=self.hrrp_music_enabled_var)
+        _c.grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=6, pady=4)
+        ToolTip(_c, "启用后在当前 HRRP 图上叠加 MUSIC 距离伪谱\n适合近距离多目标分辨对比，不替代 FFT 主曲线")
+        self._field(controls, 1, 2, "MUSIC源数", self.hrrp_music_source_var,
+                    tip="MUSIC 假定的目标/信号源数量\n源数过大容易产生虚假峰，通常与目标数一致或略小")
 
     def _add_precision_tab(self) -> None:
         _tab, controls, _pane = self._make_tab("precision", "测距精度")
@@ -655,6 +662,8 @@ class RadarApp:
             min_range_m=float(self.hrrp_min_range_var.get()),
             min_gap_m=float(self.hrrp_min_gap_var.get()),
             zero_padding_power=int(float(self.zero_padding_var.get())),
+            use_music=bool(self.hrrp_music_enabled_var.get()),
+            music_source_count=int(float(self.hrrp_music_source_var.get())),
         )
         rows = [
             ("FFT 点数", result.nfft),
@@ -669,6 +678,22 @@ class RadarApp:
                     (f"目标 {idx} 3dB 宽度(m)", width[2]),
                 ]
             )
+        if result.music is not None:
+            rows.extend(
+                [
+                    ("MUSIC 源数", result.music.source_count),
+                    ("MUSIC 子空间阶数", result.music.matrix_order),
+                    ("MUSIC 快拍数", result.music.snapshot_count),
+                    ("MUSIC 检测目标数", len(result.music.targets)),
+                ]
+            )
+            for idx, (target_range, value, _peak) in enumerate(result.music.targets, start=1):
+                rows.extend(
+                    [
+                        (f"MUSIC 目标 {idx} 距离(m)", target_range),
+                        (f"MUSIC 目标 {idx} 伪谱", value),
+                    ]
+                )
         pane = self.panes["hrrp"]
         pane.set_rows(rows)
         self._plot_hrrp(pane.figure, result)
@@ -678,18 +703,40 @@ class RadarApp:
     def _plot_hrrp(self, figure: Figure, result: range_hrrp.HrrpAnalysis) -> None:
         figure.clear()
         ax = figure.add_subplot(111)
-        ax.plot(result.ranges_m, result.hrrp_db, linewidth=1.2, color="#1565c0")
+        ax.plot(result.ranges_m, result.hrrp_db, linewidth=1.2, color="#1565c0", label="FFT HRRP")
         for idx, ((target_range, _value, peak_idx), width) in enumerate(zip(result.targets, result.widths), start=1):
             ax.axvline(target_range, color="#b3261e", linestyle="--", linewidth=1.0)
             ax.plot(target_range, result.hrrp_db[peak_idx], "v", color="#b3261e")
             if np.isfinite(width[2]):
                 ax.axvspan(width[0], width[1], color="#ef6c00", alpha=0.14)
             ax.annotate(f"T{idx}: {target_range:.3f} m", (target_range, result.hrrp_db[peak_idx]), xytext=(5, 8), textcoords="offset points")
+        if result.music is not None:
+            ax.plot(
+                result.music.ranges_m,
+                result.music.spectrum_db,
+                linewidth=1.1,
+                color="#6a1b9a",
+                linestyle=":",
+                alpha=0.95,
+                label="MUSIC 伪谱",
+            )
+            for idx, (target_range, _value, peak_idx) in enumerate(result.music.targets, start=1):
+                y_value = result.music.spectrum_db[peak_idx]
+                ax.axvline(target_range, color="#6a1b9a", linestyle=":", linewidth=1.0, alpha=0.7)
+                ax.plot(target_range, y_value, "^", color="#6a1b9a", markersize=5)
+                ax.annotate(
+                    f"M{idx}: {target_range:.3f} m",
+                    (target_range, y_value),
+                    xytext=(5, -14),
+                    textcoords="offset points",
+                    color="#6a1b9a",
+                )
         ax.set_title("测距 / HRRP")
         ax.set_xlabel("距离 (m)")
         ax.set_ylabel("归一化幅度 (dB)")
         ax.set_ylim(range_hrrp.HRRP_DB_FLOOR, 4)
         ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="lower right", fontsize=8)
         figure.tight_layout()
 
     def _process_precision(self) -> None:
@@ -1107,7 +1154,7 @@ class RadarApp:
             if precision_result is None:
                 return False
             self._plot_precision_result(fig.add_subplot(111), precision_result)
-        return True
+            return True
         if module == "speed" and isinstance(result, speed.SpeedAnalysisResult):
             ax = fig.add_subplot(111)
             if title == "距离-时间热图与目标轨迹":
@@ -1252,6 +1299,8 @@ class RadarApp:
             f"chirp={self.chirp_var.get()}",
             f"window={self.window_var.get()}",
             f"zero_padding_power={self.zero_padding_var.get()}",
+            f"hrrp_music_enabled={self.hrrp_music_enabled_var.get()}",
+            f"hrrp_music_source_count={self.hrrp_music_source_var.get()}",
         ]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1260,8 +1309,10 @@ class RadarApp:
         with path.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
             if self.current_module == "hrrp" and isinstance(result, range_hrrp.HrrpAnalysis):
-                writer.writerow(["range_m", "magnitude_norm", "hrrp_db"])
-                writer.writerows(zip(result.ranges_m, result.magnitude_norm, result.hrrp_db))
+                writer.writerow(["range_m", "magnitude_norm", "hrrp_db", "music_spectrum_norm", "music_spectrum_db"])
+                music_norm = result.music.spectrum_norm if result.music is not None else [""] * len(result.ranges_m)
+                music_db = result.music.spectrum_db if result.music is not None else [""] * len(result.ranges_m)
+                writer.writerows(zip(result.ranges_m, result.magnitude_norm, result.hrrp_db, music_norm, music_db))
             elif self.current_module == "precision" and isinstance(result, list):
                 writer.writerow(["case", "range_m", "hrrp_db", "noise_mask"])
                 for item in result:

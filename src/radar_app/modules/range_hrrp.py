@@ -4,11 +4,22 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from radar_app.core.params import RadarParams
+from radar_app.core.params import C0, RadarParams
 from radar_app.core.signal import make_window, next_fft_size, normalized_db_from_amplitude, positive_range_fft
 
 
 HRRP_DB_FLOOR = -60.0
+
+
+@dataclass
+class MusicRangeResult:
+    ranges_m: np.ndarray
+    spectrum_norm: np.ndarray
+    spectrum_db: np.ndarray
+    source_count: int
+    matrix_order: int
+    snapshot_count: int
+    targets: list[tuple[float, float, int]]
 
 
 @dataclass
@@ -20,6 +31,7 @@ class HrrpAnalysis:
     nfft: int
     targets: list[tuple[float, float, int]]
     widths: list[tuple[float, float, float, float]]
+    music: MusicRangeResult | None = None
 
 
 def select_frame_data(data: np.ndarray, frame_number: int, antenna_number: int) -> np.ndarray:
@@ -62,6 +74,113 @@ def compute_hrrp(
     if magnitude.max(initial=0.0) > 0:
         magnitude = magnitude / magnitude.max()
     return ranges_m, magnitude, n_keep, nfft
+
+
+def _analytic_signal(samples: np.ndarray) -> np.ndarray:
+    if np.iscomplexobj(samples):
+        return samples.astype(np.complex128, copy=False)
+
+    values = samples.astype(np.float64, copy=False)
+    sample_count = values.shape[-1]
+    spectrum = np.fft.fft(values, axis=-1)
+    multiplier = np.zeros(sample_count, dtype=np.float64)
+    multiplier[0] = 1.0
+    if sample_count % 2 == 0:
+        multiplier[1 : sample_count // 2] = 2.0
+        multiplier[sample_count // 2] = 1.0
+    else:
+        multiplier[1 : (sample_count + 1) // 2] = 2.0
+    return np.fft.ifft(spectrum * multiplier.reshape((1,) * (values.ndim - 1) + (-1,)), axis=-1)
+
+
+def _music_matrix_order(sample_count: int, requested_order: int | None, source_count: int) -> int:
+    if requested_order is not None and requested_order > 0:
+        order = int(requested_order)
+    else:
+        order = min(64, max(8, sample_count // 2))
+    order = max(source_count + 1, order)
+    return max(2, min(sample_count - 1, order))
+
+
+def compute_music_range_spectrum(
+    frame_data: np.ndarray,
+    params: RadarParams,
+    chirp_choice: str,
+    keep_ratio: float,
+    ranges_m: np.ndarray,
+    source_count: int = 1,
+    matrix_order: int | None = None,
+    target_count: int = 1,
+    min_range_m: float = 0.15,
+    min_gap_m: float = 0.15,
+) -> MusicRangeResult:
+    chirp_index = _chirp_index(chirp_choice, frame_data.shape[0])
+    selected = frame_data if chirp_index is None else frame_data[[chirp_index], :]
+
+    n_keep = max(1, int(round(params.samples_per_chirp * keep_ratio)))
+    n_keep = min(params.samples_per_chirp, n_keep)
+    selected = _analytic_signal(selected[:, :n_keep])
+    selected = selected - np.mean(selected, axis=1, keepdims=True)
+
+    if n_keep < 8:
+        raise ValueError("MUSIC 至少需要 8 个采样点")
+
+    requested_sources = max(1, int(source_count))
+    order = _music_matrix_order(n_keep, matrix_order, requested_sources)
+    actual_sources = max(1, min(requested_sources, order - 1))
+    snapshot_count = 0
+    covariance = np.zeros((order, order), dtype=np.complex128)
+
+    for chirp_samples in selected:
+        snapshots = np.lib.stride_tricks.sliding_window_view(chirp_samples, order).T
+        if snapshots.shape[1] == 0:
+            continue
+        covariance += snapshots @ snapshots.conj().T
+        snapshot_count += snapshots.shape[1]
+
+    if snapshot_count <= actual_sources:
+        raise ValueError("MUSIC 快拍数不足，请降低源数或增加采样点")
+
+    covariance /= snapshot_count
+    exchange = np.fliplr(np.eye(order, dtype=np.complex128))
+    covariance = 0.5 * (covariance + exchange @ covariance.conj() @ exchange)
+    covariance = 0.5 * (covariance + covariance.conj().T)
+
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("MUSIC 协方差矩阵分解失败") from exc
+
+    if not np.all(np.isfinite(eigenvalues)) or not np.all(np.isfinite(eigenvectors)):
+        raise ValueError("MUSIC 协方差矩阵包含无效数值")
+
+    order_indices = np.argsort(eigenvalues)
+    noise_subspace = eigenvectors[:, order_indices[: order - actual_sources]]
+    sample_indices = np.arange(order, dtype=np.float64).reshape(-1, 1)
+    beat_freqs_hz = 2.0 * params.slope_hz_s * ranges_m / C0
+    steering = np.exp(1j * 2.0 * np.pi * sample_indices * beat_freqs_hz.reshape(1, -1) / params.sample_rate_hz)
+    projection = noise_subspace.conj().T @ steering
+    denominator = np.sum(np.abs(projection) ** 2, axis=0)
+    spectrum = 1.0 / np.maximum(denominator, 1e-300)
+    if spectrum.max(initial=0.0) > 0:
+        spectrum = spectrum / spectrum.max()
+    spectrum_db = 10.0 * np.log10(np.maximum(spectrum, 10.0 ** (HRRP_DB_FLOOR / 10.0)))
+    targets = detect_targets(
+        ranges_m,
+        spectrum,
+        target_count=max(1, int(target_count)),
+        min_range_m=min_range_m,
+        min_gap_m=min_gap_m,
+    )
+    return MusicRangeResult(
+        ranges_m=ranges_m,
+        spectrum_norm=spectrum,
+        spectrum_db=spectrum_db,
+        source_count=actual_sources,
+        matrix_order=order,
+        snapshot_count=int(snapshot_count),
+        targets=targets,
+    )
 
 
 def _parabolic_peak(ranges_m: np.ndarray, values: np.ndarray, index: int) -> tuple[float, float]:
@@ -172,6 +291,9 @@ def analyze_hrrp(
     min_range_m: float,
     min_gap_m: float,
     zero_padding_power: int = 5,
+    use_music: bool = False,
+    music_source_count: int = 1,
+    music_matrix_order: int | None = None,
 ) -> HrrpAnalysis:
     frame_data = select_frame_data(data, frame_number, antenna_number)
     ranges_m, magnitude, n_keep, nfft = compute_hrrp(
@@ -185,6 +307,20 @@ def analyze_hrrp(
     hrrp_db = normalized_db_from_amplitude(magnitude, HRRP_DB_FLOOR)
     targets = detect_targets(ranges_m, magnitude, target_count, min_range_m, min_gap_m)
     widths = [measure_3db_width(ranges_m, hrrp_db, index) for _range, _value, index in targets]
+    music = None
+    if use_music:
+        music = compute_music_range_spectrum(
+            frame_data,
+            params,
+            chirp_choice,
+            keep_ratio,
+            ranges_m,
+            source_count=music_source_count,
+            matrix_order=music_matrix_order,
+            target_count=target_count,
+            min_range_m=min_range_m,
+            min_gap_m=min_gap_m,
+        )
     return HrrpAnalysis(
         ranges_m=ranges_m,
         magnitude_norm=magnitude,
@@ -193,4 +329,5 @@ def analyze_hrrp(
         nfft=nfft,
         targets=targets,
         widths=widths,
+        music=music,
     )
