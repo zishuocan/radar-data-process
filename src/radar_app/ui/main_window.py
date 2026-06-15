@@ -22,7 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 from radar_app.core import FORMAT_OPTIONS, WINDOW_OPTIONS, LoadedRadarData, RadarParams, load_radar_data
-from radar_app.modules import angle, range_hrrp, range_precision, speed
+from radar_app.modules import angle, angle_tasks, range_hrrp, range_precision, speed
 
 
 class ToolTip:
@@ -314,6 +314,7 @@ class RadarApp:
         self._add_speed_tab()
         self._add_range_doppler_tab()
         self._add_angle_tab()
+        self._add_angle_tasks_tab()
 
     def _make_tab(self, key: str, title: str) -> tuple[ttk.Frame, ttk.Frame, ResultPane]:
         tab = ttk.Frame(self.tabs, padding=8)
@@ -438,6 +439,206 @@ class RadarApp:
         self._field(controls, 2, 4, "阈值(dB)", self.angle_threshold_var,
                     tip="CFAR 检测门限（dB）\n越低检测灵敏度越高，虚警也越多\n0 表示自适应门限")
 
+    # ---- 测角实验任务标签页 ----
+
+    def _add_angle_tasks_tab(self) -> None:
+        _tab, controls, _pane = self._make_tab("angle_tasks", "测角实验")
+        btn_frame = ttk.Frame(controls)
+        btn_frame.grid(row=0, column=0, columnspan=12, sticky=tk.EW, pady=4)
+        # 5 个任务按钮
+        task_names = [
+            ("1. 一维距离像", 1), ("2. 相位差分", 2), ("3. 方位FFT", 3),
+            ("4. 二维FFT", 4), ("5. CFAR检测", 5),
+        ]
+        for ci, (tname, tnum) in enumerate(task_names):
+            _b = ttk.Button(btn_frame, text=tname, command=lambda n=tnum: self._run_angle_task(n))
+            _b.grid(row=0, column=ci * 2, padx=4, pady=2, sticky=tk.EW)
+            ToolTip(_b, f"执行实验任务 {tnum}")
+        btn_frame.columnconfigure(8, weight=1)
+
+        self.angle_task_result_var = tk.StringVar(value="待执行")
+        ttk.Label(controls, textvariable=self.angle_task_result_var,
+                  font=("Microsoft YaHei", 9)).grid(row=1, column=0, columnspan=12, sticky=tk.W, padx=6, pady=4)
+
+    def _run_angle_task(self, task_num: int) -> None:
+        """执行指定的测角实验任务"""
+        if self.loaded is None:
+            self.load_file()
+        if self.loaded is None:
+            messagebox.showerror("错误", "请先读取 bin 文件")
+            return
+
+        params = self._params()
+        pane = self.panes["angle_tasks"]
+        pane.figure.clear()
+        rows: list[tuple[str, object]] = []
+
+        try:
+            if task_num == 1:
+                self._angle_task1(pane, params, rows)
+            elif task_num == 2:
+                self._angle_task2(pane, params, rows)
+            elif task_num == 3:
+                self._angle_task3(pane, params, rows)
+            elif task_num == 4:
+                self._angle_task4(pane, params, rows)
+            elif task_num == 5:
+                self._angle_task5(pane, params, rows)
+        except Exception as exc:
+            messagebox.showerror(f"任务 {task_num} 失败", str(exc))
+            self.status_var.set(f"任务 {task_num} 失败: {exc}")
+            return
+
+        pane.set_rows(rows)
+        pane.figure.tight_layout()
+        pane.canvas.draw_idle()
+        self.angle_task_result_var.set(f"任务 {task_num} 完成")
+        self.status_var.set(f"测角实验任务 {task_num} 完成")
+
+    def _angle_task1(self, pane: ResultPane, params: RadarParams, rows: list[tuple[str, object]]) -> None:
+        """任务1: 一维距离像 + 通道幅度/相位"""
+        result = angle_tasks.run_task1(
+            self.loaded.data, params, int(float(self.frame_var.get())),
+            self.angle_channels_var.get(), self.window_var.get(),
+            self.chirp_var.get(), int(float(self.zero_padding_var.get())),
+            float(self.angle_min_range_var.get()), float(self.angle_max_range_var.get()),
+        )
+        ax = pane.figure.add_subplot(111)
+        ax.plot(result.ranges_m, result.hrrp_db, color="#1565c0", linewidth=1.2)
+        ax.axvline(result.target_range_m, color="#b3261e", linestyle="--", linewidth=1.0)
+        ax.set_title("任务1: 一维距离像 (HRRP)")
+        ax.set_xlabel("距离 (m)")
+        ax.set_ylabel("归一化幅度 (dB)")
+        ax.set_ylim(angle.HRRP_DB_FLOOR, 4)
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+        rows.append(("目标距离单元", f"#{result.target_index}"))
+        rows.append(("目标距离(m)", result.target_range_m))
+        for i, (a, p) in enumerate(zip(result.channel_amplitudes, result.channel_phases_deg)):
+            rows.append((f"通道{i+1} 幅度", f"{a:.6g}"))
+            rows.append((f"通道{i+1} 相位(deg)", f"{p:.3f}"))
+
+    def _angle_task2(self, pane: ResultPane, params: RadarParams, rows: list[tuple[str, object]]) -> None:
+        """任务2: 相位解缠绕 + 相邻通道相位差分"""
+        result = angle_tasks.run_task2(
+            self.loaded.data, params, int(float(self.frame_var.get())),
+            self.angle_channels_var.get(), self.window_var.get(),
+            self.chirp_var.get(), int(float(self.zero_padding_var.get())),
+            float(self.angle_min_range_var.get()), float(self.angle_max_range_var.get()),
+        )
+        ax = pane.figure.add_subplot(111)
+        channels_str = [f"CH{r['channel']}" for r in result.channel_records]
+        unwrapped_deg = [r["unwrapped_deg"] for r in result.channel_records]
+        colors = ["#1565c0", "#ef6c00", "#2e7d32", "#b3261e",
+                   "#6a1b9a", "#00838f", "#4e342e", "#558b2f"]
+        bars = ax.bar(channels_str, unwrapped_deg, color=colors[:len(unwrapped_deg)], alpha=0.8)
+        for bar, rec in zip(bars, result.channel_records):
+            delta = rec["delta_deg"]
+            label = f"{delta:+.2f}°" if delta is not None else ""
+            if label:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                        label, ha="center", va="bottom", fontsize=8)
+        ax.set_title("任务2: 解缠绕后通道相位")
+        ax.set_xlabel("通道")
+        ax.set_ylabel("相位 (deg)")
+        ax.grid(True, linestyle="--", alpha=0.3, axis="y")
+
+        rows.append(("通道数", len(result.channel_records)))
+        for r in result.channel_records:
+            ch = r["channel"]
+            rows.append((f"CH{ch} 相位(deg)", f"{r['phase_deg']:.3f}"))
+            rows.append((f"CH{ch} 解缠绕(deg)", f"{r['unwrapped_deg']:.3f}"))
+            if r["delta_deg"] is not None:
+                rows.append((f"CH{ch} Δ相位(deg)", f"{r['delta_deg']:+.3f}"))
+        rows.append(("相位差均值(deg)", f"{result.mean_delta_deg:.4f}"))
+
+    def _angle_task3(self, pane: ResultPane, params: RadarParams, rows: list[tuple[str, object]]) -> None:
+        """任务3: 方位 FFT → 方位角"""
+        result = angle_tasks.run_task3(
+            self.loaded.data, params, int(float(self.frame_var.get())),
+            self.angle_channels_var.get(), self.window_var.get(),
+            self.chirp_var.get(), int(float(self.zero_padding_var.get())),
+            float(self.angle_min_range_var.get()), float(self.angle_max_range_var.get()),
+            int(float(self.angle_fft_var.get())),
+            float(self.angle_spacing_mm_var.get()) / 1000.0,
+        )
+        ax = pane.figure.add_subplot(111)
+        ax.plot(result.angle_axis_deg, result.angle_spectrum_db, color="#1565c0", linewidth=1.2)
+        ax.axvline(result.peak_angle_deg, color="#b3261e", linestyle="--", linewidth=1.0)
+        ax.set_title("任务3: 方位角 FFT 谱")
+        ax.set_xlabel("角度 (deg)")
+        ax.set_ylabel("相对功率 (dB)")
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+        rows.append(("峰值角度(deg)", f"{result.peak_angle_deg:.4f}"))
+
+    def _angle_task4(self, pane: ResultPane, params: RadarParams, rows: list[tuple[str, object]]) -> None:
+        """任务4: 二维 FFT → 距离-角度复数图像"""
+        result = angle_tasks.run_task4(
+            self.loaded.data, params, int(float(self.frame_var.get())),
+            self.angle_channels_var.get(), self.window_var.get(),
+            self.chirp_var.get(), int(float(self.zero_padding_var.get())),
+            int(float(self.angle_fft_var.get())),
+            float(self.angle_spacing_mm_var.get()) / 1000.0,
+            float(self.angle_max_range_var.get()),
+        )
+        ax = pane.figure.add_subplot(111)
+        extent = [
+            float(result.ranges_m[0]), float(result.ranges_m[-1]),
+            float(result.angle_axis_deg[0]), float(result.angle_axis_deg[-1]),
+        ]
+        ax.imshow(result.range_angle_db, aspect="auto", origin="lower",
+                  extent=extent, cmap="turbo", vmin=RANGE_ANGLE_DB_FLOOR, vmax=0)
+        ax.set_title("任务4: 距离-角度二维图像")
+        ax.set_xlabel("距离 (m)")
+        ax.set_ylabel("角度 (deg)")
+        pane.figure.colorbar(ax.images[0], ax=ax, label="相对功率 (dB)")
+
+        rows.append(("距离单元数", result.ranges_m.size))
+        rows.append(("角度单元数", result.angle_axis_deg.size))
+        rows.append(("图像尺寸", f"{result.range_angle_db.shape[1]}×{result.range_angle_db.shape[0]}"))
+
+    def _angle_task5(self, pane: ResultPane, params: RadarParams, rows: list[tuple[str, object]]) -> None:
+        """任务5: CFAR 检测 → 目标距离和方位角"""
+        result = angle_tasks.run_task5(
+            self.loaded.data, params, int(float(self.frame_var.get())),
+            self.angle_channels_var.get(), self.window_var.get(),
+            self.chirp_var.get(), int(float(self.zero_padding_var.get())),
+            int(float(self.angle_fft_var.get())),
+            float(self.angle_spacing_mm_var.get()) / 1000.0,
+            float(self.angle_max_range_var.get()),
+            float(self.angle_min_range_var.get()),
+            int(float(self.angle_train_range_var.get())),
+            int(float(self.angle_guard_range_var.get())),
+            int(float(self.angle_train_angle_var.get())),
+            int(float(self.angle_guard_angle_var.get())),
+            float(self.angle_threshold_var.get()),
+            int(float(self.angle_max_detections_var.get())),
+            float(self.angle_gap_m_var.get()),
+            float(self.angle_gap_deg_var.get()),
+        )
+        ax = pane.figure.add_subplot(111)
+        extent = [
+            float(result.ranges_m[0]), float(result.ranges_m[-1]),
+            float(result.angle_axis_deg[0]), float(result.angle_axis_deg[-1]),
+        ]
+        ax.imshow(result.range_angle_db, aspect="auto", origin="lower",
+                  extent=extent, cmap="turbo", vmin=RANGE_ANGLE_DB_FLOOR, vmax=0)
+        for d in result.detections:
+            ax.plot(d["range_m"], d["angle_deg"], "x", color="white", markersize=8, mew=2)
+            ax.annotate(f"#{d['serial']}", (d["range_m"], d["angle_deg"]),
+                        textcoords="offset points", xytext=(6, 6),
+                        fontsize=9, color="white",
+                        bbox=dict(boxstyle="round,pad=0.2", fc="#333", ec="white", lw=0.6, alpha=0.8))
+        ax.set_title("任务5: CFAR 检测结果")
+        ax.set_xlabel("距离 (m)")
+        ax.set_ylabel("角度 (deg)")
+        pane.figure.colorbar(ax.images[0], ax=ax, label="相对功率 (dB)")
+
+        rows.append(("检测目标数", len(result.detections)))
+        for d in result.detections:
+            rows.append((f"目标 #{d['serial']}", f"R={d['range_m']:.4f}m, θ={d['angle_deg']:.3f}°"))
+
     def _draw_empty(self) -> None:
         for pane in self.panes.values():
             pane.figure.clear()
@@ -523,6 +724,8 @@ class RadarApp:
                 self._process_range_doppler()
             elif key == "angle":
                 self._process_angle()
+            elif key == "angle_tasks":
+                self._run_angle_task(1)
         except Exception as exc:
             messagebox.showerror("处理失败", str(exc))
             self.status_var.set(f"处理失败: {exc}")
