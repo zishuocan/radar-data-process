@@ -212,7 +212,7 @@ class RadarApp:
         self.angle_spacing_mm_var = tk.StringVar(value="2.0")
         self.angle_fft_var = tk.StringVar(value="256")
         self.angle_min_range_var = tk.StringVar(value="0.15")
-        self.angle_max_range_var = tk.StringVar(value="4.0")
+        self.angle_max_range_var = tk.StringVar(value="6.0")
         self.angle_gap_m_var = tk.StringVar(value="0.15")
         self.angle_gap_deg_var = tk.StringVar(value="5.0")
         self.angle_max_detections_var = tk.StringVar(value="1")
